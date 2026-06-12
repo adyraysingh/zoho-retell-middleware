@@ -308,4 +308,42 @@ app.listen(port, () => {
   console.log('[server] Health check:   GET  /health');
 });
 
+
+// ─── OAuth Callback: Exchange code for refresh token ─────────────────────────
+app.get('/oauth/callback', async (req, res) => {
+  const code = req.query.code;
+  if (!code) {
+    return res.status(400).send('No code provided');
+  }
+
+  try {
+    const tokenRes = await axios.post(
+      'https://accounts.zoho.in/oauth/v2/token',
+      null,
+      {
+        params: {
+          code,
+          client_id:     ZOHO_CLIENT_ID,
+          client_secret: ZOHO_CLIENT_SECRET,
+          redirect_uri:  'https://zoho-retell-middleware-production.up.railway.app/oauth/callback',
+          grant_type:    'authorization_code'
+        }
+      }
+    );
+
+    console.log('[oauth-callback] Token response:', JSON.stringify(tokenRes.data));
+
+    const rt = tokenRes.data.refresh_token;
+    if (rt) {
+      return res.send('<h2>SUCCESS!</h2><p>Your refresh token:</p><pre>' + rt + '</pre><p>Set this as ZOHO_REFRESH_TOKEN in Railway.</p>');
+    } else {
+      return res.send('<h2>Error</h2><pre>' + JSON.stringify(tokenRes.data) + '</pre>');
+    }
+  } catch (err) {
+    const errData = err.response ? err.response.data : err.message;
+    console.error('[oauth-callback] Error:', errData);
+    return res.status(500).send('<h2>Error</h2><pre>' + JSON.stringify(errData) + '</pre>');
+  }
+});
+
 module.exports = app;
