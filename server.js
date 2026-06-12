@@ -3,11 +3,12 @@ require('dotenv').config();
 
 const express = require('express');
 const axios = require('axios');
+const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(express.json());
 
-// ─── Environment Variables ────────────────────────────────────────────────────
+// --- Environment Variables ---
 const {
   RETELL_API_KEY,
   RETELL_AGENT_ID,
@@ -15,12 +16,14 @@ const {
   ZOHO_CLIENT_ID,
   ZOHO_CLIENT_SECRET,
   ZOHO_REFRESH_TOKEN,
-  ZOHO_API_DOMAIN,      // e.g. https://www.zohoapis.in
+  ZOHO_API_DOMAIN,
   WEBHOOK_SECRET,
+  SMTP_USER,
+  SMTP_PASS,
   PORT
 } = process.env;
 
-// ─── Zoho OAuth Token Cache ───────────────────────────────────────────────────
+// --- Zoho OAuth Token Cache ---
 let cachedToken = null;
 let tokenExpiry = 0;
 
@@ -33,9 +36,9 @@ async function getZohoAccessToken() {
     {
       params: {
         refresh_token: ZOHO_REFRESH_TOKEN,
-        client_id: ZOHO_CLIENT_ID,
+        client_id:     ZOHO_CLIENT_ID,
         client_secret: ZOHO_CLIENT_SECRET,
-        grant_type: 'refresh_token'
+        grant_type:    'refresh_token'
       }
     }
   );
@@ -45,16 +48,16 @@ async function getZohoAccessToken() {
   }
 
   cachedToken = res.data.access_token;
-  tokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000; // refresh 60s early
+  tokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
   return cachedToken;
 }
 
-// ─── Retell API: Place Outbound Call ─────────────────────────────────────────
+// --- Retell API: Place Outbound Call ---
 async function placeRetellCall(lead) {
   const payload = {
-    agent_id: RETELL_AGENT_ID,
+    agent_id:    RETELL_AGENT_ID,
     from_number: RETELL_FROM_NUMBER,
-    to_number: lead.phone,
+    to_number:   lead.phone,
     retell_llm_dynamic_variables: {
       lead_id:      lead.id,
       lead_name:    lead.name,
@@ -73,9 +76,9 @@ async function placeRetellCall(lead) {
   return res.data;
 }
 
-// ─── Zoho CRM: Update Lead Fields ────────────────────────────────────────────
+// --- Zoho CRM: Update Lead Fields ---
 async function updateZohoLead(leadId, fields) {
-  const token = await getZohoAccessToken();
+  const token   = await getZohoAccessToken();
   const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
 
   await axios.put(
@@ -85,17 +88,27 @@ async function updateZohoLead(leadId, fields) {
   );
 }
 
-// ─── Zoho CRM: Send Email ─────────────────────────────────────────────────────
-async function sendBookingEmail(leadId, leadName, leadEmail) {
-  const token = await getZohoAccessToken();
-  const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
+// --- Send Booking Email via SMTP (Zoho Mail) ---
+async function sendBookingEmail(leadName, leadEmail) {
+  if (!SMTP_USER || !SMTP_PASS) {
+    throw new Error('SMTP_USER or SMTP_PASS not configured');
+  }
 
-  const emailPayload = {
-    data: [{
-      from: { user_name: 'MakeYourLabel', email: process.env.FROM_EMAIL || 'info@makeyourlabel.com' },
-      to:   [{ user_name: leadName, email: leadEmail }],
-      subject: 'Your Free Consultation Booking – MakeYourLabel',
-      content: `Hi ${leadName},
+  const transporter = nodemailer.createTransport({
+    host:   'smtp.zoho.in',
+    port:   465,
+    secure: true,
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS
+    }
+  });
+
+  await transporter.sendMail({
+    from:    `"MakeYourLabel" <${SMTP_USER}>`,
+    to:      `"${leadName}" <${leadEmail}>`,
+    subject: 'Your Free Consultation Booking - MakeYourLabel',
+    text: `Hi ${leadName},
 
 Thank you for your interest in launching your own clothing brand with MakeYourLabel!
 
@@ -103,25 +116,20 @@ We would love to connect with you. Please book your free consultation using the 
 
 https://makeyourlabel.zohobookings.in/#/makeyourlabel
 
-Our team will walk you through everything — from design to production.
+Our team will walk you through everything - from design to production.
 
 Looking forward to speaking with you!
 
 Warm regards,
 Team MakeYourLabel
-www.makeyourlabel.com`
-    }]
-  };
-
-  await axios.post(
-    `${baseUrl}/crm/v3/Leads/${leadId}/actions/send_mail`,
-    emailPayload,
-    { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
-  );
+www.makeyourlabel.com`,
+    html: `<p>Hi ${leadName},</p><p>Thank you for your interest in launching your own clothing brand with <strong>MakeYourLabel</strong>!</p><p>Please book your free consultation:</p><p><a href="https://makeyourlabel.zohobookings.in/#/makeyourlabel" style="background:#0066cc;color:#fff;padding:12px 24px;text-decoration:none;border-radius:4px;display:inline-block;">Book Free Consultation</a></p><p>Our team will walk you through everything - from design to production.</p><br><p>Warm regards,<br><strong>Team MakeYourLabel</strong><br>www.makeyourlabel.com</p>`
+  });
 }
 
-// ─── Analyze Transcript for Outcome ──────────────────────────────────────────
-function analyzeTranscript(transcript = '') {
+// --- Analyze Transcript for Outcome ---
+function analyzeTranscript(transcript) {
+  transcript = transcript || '';
   const lower = transcript.toLowerCase();
 
   if (!transcript || transcript.trim().length < 10) {
@@ -139,35 +147,34 @@ function analyzeTranscript(transcript = '') {
     'please remove', 'do not call', 'busy', 'wrong number'
   ];
 
-  const isPositive = positiveSignals.some(s => lower.includes(s));
-  const isNegative = negativeSignals.some(s => lower.includes(s));
+  const isPositive = positiveSignals.some(function(s) { return lower.includes(s); });
+  const isNegative = negativeSignals.some(function(s) { return lower.includes(s); });
 
   if (isNegative) return { outcome: 'Not Interested', meetingInterested: 'No' };
-  if (isPositive) return { outcome: 'Interested', meetingInterested: 'Yes' };
+  if (isPositive) return { outcome: 'Interested',     meetingInterested: 'Yes' };
 
   return { outcome: 'Callback Requested', meetingInterested: 'No' };
 }
 
-// ─── Retry Utility ────────────────────────────────────────────────────────────
-async function withRetry(fn, retries = 3, delayMs = 2000) {
+// --- Retry Utility ---
+async function withRetry(fn, retries, delayMs) {
+  retries = retries || 3;
+  delayMs = delayMs || 2000;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       return await fn();
     } catch (err) {
       if (attempt === retries) throw err;
-      console.warn(`Attempt ${attempt} failed, retrying in ${delayMs}ms...`);
-      await new Promise(r => setTimeout(r, delayMs));
+      console.warn('Attempt ' + attempt + ' failed, retrying in ' + delayMs + 'ms...');
+      await new Promise(function(r) { setTimeout(r, delayMs); });
     }
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ROUTE 1: Zoho CRM Webhook → Receive new lead → Trigger Retell AI call
-// ═══════════════════════════════════════════════════════════════════════════════
+// ROUTE 1: Zoho CRM Webhook -> Receive new lead -> Trigger Retell AI call
 app.post('/webhook/zoho-lead', async (req, res) => {
   console.log('[zoho-lead] Incoming payload:', JSON.stringify(req.body, null, 2));
 
-  // ── Authenticate ──
   const { webhook_secret, id, First_Name, Last_Name, Phone, Email, Company } = req.body;
 
   if (!WEBHOOK_SECRET || webhook_secret !== WEBHOOK_SECRET) {
@@ -175,7 +182,6 @@ app.post('/webhook/zoho-lead', async (req, res) => {
     return res.status(403).json({ error: 'Unauthorized' });
   }
 
-  // ── Validate phone ──
   if (!Phone) {
     console.warn('[zoho-lead] No phone number for lead', id);
     return res.status(400).json({ error: 'Phone number required' });
@@ -183,29 +189,31 @@ app.post('/webhook/zoho-lead', async (req, res) => {
 
   const lead = {
     id,
-    name:    `${First_Name || ''} ${Last_Name || ''}`.trim() || 'Valued Lead',
+    name:    (First_Name || '') + ' ' + (Last_Name || ''),
     phone:   Phone,
     email:   Email,
     company: Company
   };
+  lead.name = lead.name.trim() || 'Valued Lead';
 
-  // ── Trigger call with retry ──
   try {
-    const callData = await withRetry(() => placeRetellCall(lead));
-    console.log(`[zoho-lead] Call placed. call_id=${callData.call_id}`);
+    const callData = await withRetry(function() { return placeRetellCall(lead); });
+    console.log('[zoho-lead] Call placed. call_id=' + callData.call_id);
 
-    // Update CRM: mark call initiated
-    await updateZohoLead(id, {
-      AI_Last_Call_Status: 'Call Initiated',
-      AI_Last_Call_Date:   new Date().toISOString()
-    });
+    try {
+      await updateZohoLead(id, {
+        AI_Last_Call_Status: 'Call Initiated',
+        AI_Last_Call_Date:   new Date().toISOString()
+      });
+    } catch (crmErr) {
+      console.warn('[zoho-lead] CRM status update failed (non-fatal):', crmErr.message);
+    }
 
     return res.json({ success: true, call_id: callData.call_id });
 
   } catch (err) {
-    console.error('[zoho-lead] Failed to place call:', err.response?.data || err.message);
+    console.error('[zoho-lead] Failed to place call:', err.response ? err.response.data : err.message);
 
-    // Update CRM: mark call failed
     try {
       await updateZohoLead(id, { AI_Last_Call_Status: 'Call Failed' });
     } catch (updateErr) {
@@ -216,91 +224,88 @@ app.post('/webhook/zoho-lead', async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ROUTE 2: Retell AI Post-Call Webhook → Update CRM + Send Email
-// ═══════════════════════════════════════════════════════════════════════════════
+// ROUTE 2: Retell AI Post-Call Webhook -> Update CRM + Send Email
 app.post('/webhook/retell-callback', async (req, res) => {
-  console.log('[retell-callback] Incoming event:', req.body?.event);
+  console.log('[retell-callback] Incoming event:', req.body && req.body.event);
 
   const { event, call } = req.body;
 
-  // Only process completed calls
   if (event !== 'call_ended') {
     return res.json({ ignored: true, event });
   }
 
-  const vars         = call?.retell_llm_dynamic_variables || {};
-  const leadId       = vars.lead_id;
-  const leadName     = vars.lead_name || 'Lead';
-  const leadEmail    = vars.lead_email || '';
-  const transcript   = call?.transcript || '';
-  const recordingUrl = call?.recording_url || '';
-  const transcriptUrl= call?.public_log_url || '';
-  const disconnectReason = call?.disconnection_reason || 'unknown';
+  const vars           = (call && call.retell_llm_dynamic_variables) || {};
+  const leadId         = vars.lead_id;
+  const leadName       = vars.lead_name  || 'Lead';
+  const leadEmail      = vars.lead_email || '';
+  const transcript     = (call && call.transcript)     || '';
+  const recordingUrl   = (call && call.recording_url)  || '';
+  const transcriptUrl  = (call && call.public_log_url) || '';
+  const disconnectReason = (call && call.disconnection_reason) || 'unknown';
 
   if (!leadId) {
     console.warn('[retell-callback] No lead_id in dynamic variables');
     return res.status(400).json({ error: 'lead_id missing in call variables' });
   }
 
-  // ── Determine call status ──
   let callStatus = 'Completed';
   if (disconnectReason === 'machine_detected') callStatus = 'Voicemail';
-  else if (disconnectReason === 'dial_no_answer')  callStatus = 'No Answer';
-  else if (disconnectReason === 'dial_failed')      callStatus = 'Failed';
+  else if (disconnectReason === 'dial_no_answer') callStatus = 'No Answer';
+  else if (disconnectReason === 'dial_failed')    callStatus = 'Failed';
 
-  // ── Analyze transcript ──
-  const { outcome, meetingInterested } = analyzeTranscript(transcript);
+  const analysis = analyzeTranscript(transcript);
+  const outcome = analysis.outcome;
+  const meetingInterested = analysis.meetingInterested;
   const bookingLinkSent = meetingInterested === 'Yes' ? 'Yes' : 'No';
 
-  console.log(`[retell-callback] leadId=${leadId} status=${callStatus} outcome=${outcome} interested=${meetingInterested}`);
+  console.log('[retell-callback] leadId=' + leadId + ' status=' + callStatus + ' outcome=' + outcome + ' interested=' + meetingInterested);
 
-  // ── Update Zoho CRM ──
   try {
-    await withRetry(() => updateZohoLead(leadId, {
-      AI_Last_Call_Status: callStatus,
-      AI_Last_Call_Date:   new Date().toISOString(),
-      Call_Outcome:        outcome,
-      Meeting_Interested:  meetingInterested,
-      Booking_Link_Sent:   bookingLinkSent,
-      Call_Summary:        transcript.slice(0, 2000),
-      Recording_URL:       recordingUrl,
-      Transcript_URL:      transcriptUrl
-    }));
+    await withRetry(function() {
+      return updateZohoLead(leadId, {
+        AI_Last_Call_Status: callStatus,
+        AI_Last_Call_Date:   new Date().toISOString(),
+        Call_Outcome:        outcome,
+        Meeting_Interested:  meetingInterested,
+        Booking_Link_Sent:   bookingLinkSent,
+        Call_Summary:        transcript.slice(0, 2000),
+        Recording_URL:       recordingUrl,
+        Transcript_URL:      transcriptUrl
+      });
+    });
     console.log('[retell-callback] CRM updated successfully');
   } catch (err) {
-    console.error('[retell-callback] CRM update failed:', err.response?.data || err.message);
+    console.error('[retell-callback] CRM update failed:', err.response ? err.response.data : err.message);
   }
 
-  // ── Send booking email if interested ──
   if (meetingInterested === 'Yes' && leadEmail) {
     try {
-      await withRetry(() => sendBookingEmail(leadId, leadName, leadEmail));
-      console.log(`[retell-callback] Booking email sent to ${leadEmail}`);
+      await withRetry(function() { return sendBookingEmail(leadName, leadEmail); });
+      console.log('[retell-callback] Booking email sent to ' + leadEmail);
     } catch (err) {
-      console.error('[retell-callback] Email send failed:', err.response?.data || err.message);
+      console.error('[retell-callback] Email send failed:', err.message);
     }
   }
 
   return res.json({ success: true, leadId, callStatus, outcome, meetingInterested, bookingLinkSent });
 });
 
-// ─── Health Check ─────────────────────────────────────────────────────────────
+// Health Check
 app.get('/health', (req, res) => {
   res.json({
-    status: 'ok',
-    service: 'zoho-retell-middleware',
+    status:    'ok',
+    service:   'zoho-retell-middleware',
     timestamp: new Date().toISOString()
   });
 });
 
-// ─── Start Server ─────────────────────────────────────────────────────────────
+// Start Server
 const port = PORT || 3000;
 app.listen(port, () => {
-  console.log(`[server] zoho-retell-middleware running on port ${port}`);
-  console.log(`[server] Retell webhook:   POST /webhook/retell-callback`);
-  console.log(`[server] Zoho webhook:     POST /webhook/zoho-lead`);
-  console.log(`[server] Health check:     GET  /health`);
+  console.log('[server] zoho-retell-middleware running on port ' + port);
+  console.log('[server] Retell webhook: POST /webhook/retell-callback');
+  console.log('[server] Zoho webhook:   POST /webhook/zoho-lead');
+  console.log('[server] Health check:   GET  /health');
 });
 
 module.exports = app;
