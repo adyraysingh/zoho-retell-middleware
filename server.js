@@ -13,13 +13,14 @@ const {
       RETELL_API_KEY,
       RETELL_AGENT_ID,
       RETELL_FROM_NUMBER,
-      ZOHO_CLIENT_ID,
+      ZOHO_CLIENT_ID
       ZOHO_CLIENT_SECRET,
       ZOHO_REFRESH_TOKEN,
       ZOHO_API_DOMAIN,
       WEBHOOK_SECRET,
       SMTP_USER,
       SMTP_PASS,
+      RESEND_API_KEY,
       PORT
 } = process.env;
 
