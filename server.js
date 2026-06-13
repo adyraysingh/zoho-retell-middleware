@@ -146,19 +146,22 @@ for (const key of picklistFields) {
 }
 }
 
-// --- Send Onboarding Email via SMTP (Zoho Mail) ---
+// --- Send Onboarding Email via Outlook SMTP ---
 async function sendBookingEmail(leadName, leadEmail) {
       if (!SMTP_USER || !SMTP_PASS) {
             throw new Error('SMTP_USER or SMTP_PASS not configured');
       }
 
 const transporter = nodemailer.createTransport({
-      host: 'smtp.zoho.in',
-      port: 465,
-      secure: true,
+      host: 'smtp.office365.com',
+      port: 587,
+      secure: false,
       auth: {
             user: SMTP_USER,
             pass: SMTP_PASS
+      },
+      tls: {
+            ciphers: 'SSLv3'
       }
 });
 
