@@ -8,7 +8,7 @@ const axios = require('axios');
 const app = express();
 app.use(express.json());
 
-// --- Environment Variables ---
+// --- Environment Variables --
 const {
       RETELL_API_KEY,
       RETELL_AGENT_ID,
@@ -145,6 +145,19 @@ for (const key of picklistFields) {
             console.error(`[zoho-update] Picklist field FAILED: ${key}="${value}" => ${errDetail}`);
       }
 }
+}
+
+// --- Zoho CRM: Add Note to Lead after call ---
+async function addZohoNote(leadId, leadName, callStatus, outcome, transcript, callDate) {
+        const token = await getZohoAccessToken();
+        const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
+        const noteTitle = `AI Call Summary - ${callDate}`;
+        const noteContent = `Call Date: ${callDate}\nLead Name: ${leadName}\nCall Status: ${callStatus}\nOutcome: ${outcome}\n\n--- Conversation Transcript ---\n${transcript || 'No transcript available'}`;
+        await axios.post(
+                  `${baseUrl}/crm/v3/Notes`,
+              { data: [{ Note_Title: noteTitle, Note_Content: noteContent, Parent_Id: leadId, se_module: 'Leads' }] },
+              { headers: { Authorization: `Zoho-oauthtoken ${token}` } }
+                );
 }
 
 // --- Send Onboarding Email via Resend API ---
@@ -324,6 +337,15 @@ app.post('/webhook/retell-callback', async (req, res) => {
          });
 
          console.log('[retell-callback] CRM update completed (check above for any per-field errors)');
+
+        // --- Add call summary as Note in Zoho Lead ---
+        try {
+                  const callDate = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+                  await addZohoNote(leadId, leadName, callStatus, outcome, transcript, callDate);
+                  console.log('[retell-callback] Call summary note added to lead ' + leadId);
+        } catch (noteErr) {
+                  console.error('[retell-callback] Failed to add note:', noteErr.response ? JSON.stringify(noteErr.response.data) : noteErr.message);
+        }
 
          if (meetingInterested === 'Yes' && leadEmail) {
                try {
