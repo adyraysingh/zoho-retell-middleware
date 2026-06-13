@@ -3,7 +3,7 @@ require('dotenv').config();
 
 const express = require('express');
 const axios = require('axios');
-const nodemailer = require('nodemailer');
+// Email sent via Resend API
 
 const app = express();
 app.use(express.json());
@@ -146,45 +146,27 @@ for (const key of picklistFields) {
 }
 }
 
-// --- Send Onboarding Email via Outlook SMTP ---
+// --- Send Onboarding Email via Resend API ---
 async function sendBookingEmail(leadName, leadEmail) {
-      if (!SMTP_USER || !SMTP_PASS) {
-            throw new Error('SMTP_USER or SMTP_PASS not configured');
+      if (!RESEND_API_KEY) {
+            throw new Error('RESEND_API_KEY not configured');
       }
 
-const transporter = nodemailer.createTransport({
-      host: 'smtp.office365.com',
-      port: 587,
-      secure: false,
-      auth: {
-            user: SMTP_USER,
-            pass: SMTP_PASS
-      },
-      tls: {
-            ciphers: 'SSLv3'
-      }
-});
+  const firstName = leadName.split(' ')[0] || leadName;
 
-const firstName = leadName.split(' ')[0] || leadName;
-
-await transporter.sendMail({
-      from: `"MAYA | MakeYourLabel" <${SMTP_USER}>`,
-      to: `"${leadName}" <${leadEmail}>`,
-      subject: 'Get Started with MakeYourLabel',
-      text: `Hi ${firstName},\n\nThank you for your interest in MakeYourLabel.\n\nTo get started, please complete your onboarding using the link below:\n\nhttps://onboarding.makeyourlabel.com/\n\nOnce submitted, our team will review your requirements and begin planning your brand launch.\n\nIf you have any questions, simply reply to this email.\n\nRegards,\nMAYA\nMakeYourLabel`,
-      html: `<div style="font-family:Arial,sans-serif;font-size:15px;color:#222;line-height:1.7;max-width:600px;">
-      <p>Hi ${firstName},</p>
-      <p>Thank you for your interest in MakeYourLabel.</p>
-      <p>To get started, please complete your onboarding using the link below:</p>
-      <p><a href="https://onboarding.makeyourlabel.com/" style="background:#000;color:#fff;padding:12px 28px;text-decoration:none;border-radius:4px;display:inline-block;font-weight:bold;">Start Onboarding</a></p>
-      <p>Once submitted, our team will review your requirements and begin planning your brand launch.</p>
-      <p>If you have any questions, simply reply to this email.</p>
-      <br>
-      <p>Regards,<br><strong>MAYA</strong><br>MakeYourLabel</p>
-      </div>`
-});
+        await axios.post('https://api.resend.com/emails', {
+                  from: 'MAYA | MakeYourLabel <aditya.raysingh@makeyourlabel.com>',
+                  to: [leadEmail],
+                  subject: 'Get Started with MakeYourLabel',
+                  text: `Hi ${firstName},\n\nThank you for your interest in MakeYourLabel.\n\nTo get started, please complete your onboarding using the link below:\n\nhttps://onboarding.makeyourlabel.com/\n\nOnce submitted, our team will review your requirements and begin planning your brand launch.\n\nIf you have any questions, simply reply to this email.\n\nRegards,\nMAYA\nMakeYourLabel`,
+                  html: `<div style="font-family:Arial,sans-serif;font-size:15px;color:#222;line-height:1.7;max-width:600px;"><p>Hi ${firstName},</p><p>Thank you for your interest in MakeYourLabel.</p><p>To get started, please complete your onboarding using the link below:</p><p><a href="https://onboarding.makeyourlabel.com/" style="background:#000;color:#fff;padding:12px 28px;text-decoration:none;border-radius:4px;display:inline-block;font-weight:bold;">Start Onboarding</a></p><p>Once submitted, our team will review your requirements and begin planning your brand launch.</p><p>If you have any questions, simply reply to this email.</p><br><p>Regards,<br><strong>MAYA</strong><br>MakeYourLabel</p></div>`
+        }, {
+                  headers: {
+                              Authorization: `Bearer ${RESEND_API_KEY}`,
+                              'Content-Type': 'application/json'
+                  }
+        });
 }
-
 // --- Analyze Transcript for Outcome ---
 function analyzeTranscript(transcript) {
       transcript = transcript || '';
