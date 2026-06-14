@@ -71,7 +71,7 @@ async function placeRetellCall(lead) {
                               lead_name: lead.name,
                               lead_email: lead.email,
                               company: lead.company || 'your company',
-                              booking_link: 'https://onboarding.makeyourlabel.com/'
+                              booking_link: 'https://start.makeyourlabel.com/'
                   }
         };
         const res = await axios.post(
@@ -156,8 +156,8 @@ async function sendBookingEmail(leadName, leadEmail) {
                   from: 'MAYA | MakeYourLabel <aditya.raysingh@makeyourlabel.com>',
                   to: [leadEmail],
                   subject: 'Get Started with MakeYourLabel',
-                  text: `Hi ${firstName},\n\nThank you for your interest in MakeYourLabel.\n\nTo get started, please complete your onboarding using the link below:\n\nhttps://onboarding.makeyourlabel.com/\n\nOnce submitted, our team will review your requirements and begin planning your brand launch.\n\nIf you have any questions, simply reply to this email.\n\nRegards,\nMAYA\nMakeYourLabel`,
-                  html: `<div style="font-family:Arial,sans-serif;font-size:15px;color:#222;line-height:1.7;max-width:600px;"><p>Hi ${firstName},</p><p>Thank you for your interest in MakeYourLabel.</p><p>To get started, please complete your onboarding using the link below:</p><p><a href="https://onboarding.makeyourlabel.com/" style="background:#000;color:#fff;padding:12px 28px;text-decoration:none;border-radius:4px;display:inline-block;font-weight:bold;">Start Onboarding</a></p><p>Once submitted, our team will review your requirements and begin planning your brand launch.</p><p>If you have any questions, simply reply to this email.</p><br><p>Regards,<br><strong>MAYA</strong><br>MakeYourLabel</p></div>`
+                  text: `Hi ${firstName},\n\nThank you for your interest in MakeYourLabel.\n\nTo get started, please complete your onboarding using the link below:\n\nhttps://start.makeyourlabel.com/\n\nOnce submitted, our team will review your requirements and begin planning your brand launch.\n\nIf you have any questions, simply reply to this email.\n\nRegards,\nMAYA\nMakeYourLabel`,
+                  html: `<div style="font-family:Arial,sans-serif;font-size:15px;color:#222;line-height:1.7;max-width:600px;"><p>Hi ${firstName},</p><p>Thank you for your interest in MakeYourLabel.</p><p>To get started, please complete your onboarding using the link below:</p><p><a href="https://start.makeyourlabel.com/" style="background:#000;color:#fff;padding:12px 28px;text-decoration:none;border-radius:4px;display:inline-block;font-weight:bold;">Start Onboarding</a></p><p>Once submitted, our team will review your requirements and begin planning your brand launch.</p><p>If you have any questions, simply reply to this email.</p><br><p>Regards,<br><strong>MAYA</strong><br>MakeYourLabel</p></div>`
         }, {
                   headers: {
                               Authorization: `Bearer ${RESEND_API_KEY}`,
