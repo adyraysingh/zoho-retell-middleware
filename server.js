@@ -492,7 +492,95 @@ app.post('/webhook/retell-callback', async (req, res) => {
 app.get('/health', (req, res) => {
         res.json({
                   status: 'ok',
-                  service: 'zoho-retell-middleware',
+                  // --- ROUTE 3: One-time requeue — reschedule 9PM IST follow-up for all past leads with AI_Call_Count < 3 ---
+                // Skips: Interested, Not Interested, Completed, Max Calls Reached, no phone
+                // Call this once: POST /admin/requeue-pending-leads  (protected by WEBHOOK_SECRET)
+                app.post('/admin/requeue-pending-leads', async (req, res) => {
+                          const { secret } = req.body;
+                          if (!WEBHOOK_SECRET || secret !== WEBHOOK_SECRET) {
+                                      return res.status(403).json({ error: 'Unauthorized' });
+                          }
+                        
+                          const TERMINAL = ['Interested', 'Not Interested', 'Completed', 'Max Calls Reached'];
+                          const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
+                          let page = 1;
+                          const perPage = 200;
+                          let queued = 0;
+                          let skipped = 0;
+                          let errors = 0;
+                          let totalFetched = 0;
+                        
+                          console.log('[requeue] Starting requeue of pending leads...');
+                        
+                          try {
+                                      while (true) {
+                                                    const token = await getZohoAccessToken();
+                                                    // Fetch leads page by page, selecting only the fields we need
+                                                    const searchRes = await axios.get(`${baseUrl}/crm/v3/Leads`, {
+                                                                    headers: { Authorization: `Zoho-oauthtoken ${token}` },
+                                                                    params: {
+                                                                                      fields: 'id,First_Name,Last_Name,Phone,Email,Company,AI_Call_Count,AI_Last_Call_Status',
+                                                                                      per_page: perPage,
+                                                                                      page: page
+                                                                            }
+                                                    });
+                                              
+                                                    const leads = (searchRes.data && searchRes.data.data) || [];
+                                                    totalFetched += leads.length;
+                                              
+                                                    if (leads.length === 0) break;
+                                              
+                                                    for (const lead of leads) {
+                                                                    const callCount = parseInt(lead.AI_Call_Count || '0', 10);
+                                                                    const status = (lead.AI_Last_Call_Status || '').trim();
+                                                                    const phone = lead.Phone || '';
+                                                            
+                                                                    // Skip: already at max, terminal status, or no phone
+                                                                    if (callCount >= MAX_CALLS_PER_LEAD) { skipped++; continue; }
+                                                                    if (TERMINAL.includes(status)) { skipped++; continue; }
+                                                                    if (!phone) { skipped++; continue; }
+                                                                    // Skip leads never called (callCount = 0) — they will be triggered by Zoho webhook naturally
+                                                                    if (callCount === 0) { skipped++; continue; }
+                                                            
+                                                                    const leadObj = {
+                                                                                      id: lead.id,
+                                                                                      name: ((lead.First_Name || '') + ' ' + (lead.Last_Name || '')).trim() || 'Valued Lead',
+                                                                                      phone: phone,
+                                                                                      email: lead.Email || '',
+                                                                                      company: lead.Company || ''
+                                                                    };
+                                                            
+                                                                    try {
+                                                                                      const delayMs = getDelayUntilNext9PMIST();
+                                                                                      const fireAt = new Date(Date.now() + delayMs).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '') + ' UTC';
+                                                                                      await safeUpdateZohoLead(lead.id, {
+                                                                                                          AI_Last_Call_Status: 'Follow-Up Scheduled',
+                                                                                                          AI_Follow_Up_Scheduled: fireAt
+                                                                                              });
+                                                                                      scheduleFollowUpCall(leadObj, delayMs);
+                                                                                      console.log(`[requeue] Scheduled lead ${lead.id} (${leadObj.name}) callCount=${callCount} -> 9PM IST today`);
+                                                                                      queued++;
+                                                                    } catch (err) {
+                                                                                      console.error(`[requeue] Failed to schedule lead ${lead.id}:`, err.message);
+                                                                                      errors++;
+                                                                    }
+                                                    }
+                                              
+                                                    // Check if there are more pages
+                                                    const info = searchRes.data && searchRes.data.info;
+                                                    if (!info || !info.more_records) break;
+                                                    page++;
+                                      }
+                          } catch (err) {
+                                      console.error('[requeue] Fatal error fetching leads:', err.message);
+                                      return res.status(500).json({ error: 'Failed to fetch leads', details: err.message, queued, skipped, errors });
+                          }
+                        
+                          console.log(`[requeue] Done. Total fetched=${totalFetched}, queued=${queued}, skipped=${skipped}, errors=${errors}`);
+                          return res.json({ success: true, totalFetched, queued, skipped, errors });
+                });
+        
+        service: 'zoho-retell-middleware',
                   timestamp: new Date().toISOString()
         });
 });
