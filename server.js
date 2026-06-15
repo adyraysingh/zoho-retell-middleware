@@ -492,98 +492,90 @@ app.post('/webhook/retell-callback', async (req, res) => {
 app.get('/health', (req, res) => {
         res.json({
                   status: 'ok',
-                  // --- ROUTE 3: One-time requeue — reschedule 9PM IST follow-up for all past leads with AI_Call_Count < 3 ---
-                // Skips: Interested, Not Interested, Completed, Max Calls Reached, no phone
-                // Call this once: POST /admin/requeue-pending-leads  (protected by WEBHOOK_SECRET)
-                app.post('/admin/requeue-pending-leads', async (req, res) => {
-                          const { secret } = req.body;
-                          if (!WEBHOOK_SECRET || secret !== WEBHOOK_SECRET) {
-                                      return res.status(403).json({ error: 'Unauthorized' });
-                          }
-                        
-                          const TERMINAL = ['Interested', 'Not Interested', 'Completed', 'Max Calls Reached'];
-                          const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
-                          let page = 1;
-                          const perPage = 200;
-                          let queued = 0;
-                          let skipped = 0;
-                          let errors = 0;
-                          let totalFetched = 0;
-                        
-                          console.log('[requeue] Starting requeue of pending leads...');
-                        
-                          try {
-                                      while (true) {
-                                                    const token = await getZohoAccessToken();
-                                                    // Fetch leads page by page, selecting only the fields we need
-                                                    const searchRes = await axios.get(`${baseUrl}/crm/v3/Leads`, {
-                                                                    headers: { Authorization: `Zoho-oauthtoken ${token}` },
-                                                                    params: {
-                                                                                      fields: 'id,First_Name,Last_Name,Phone,Email,Company,AI_Call_Count,AI_Last_Call_Status',
-                                                                                      per_page: perPage,
-                                                                                      page: page
-                                                                            }
-                                                    });
-                                              
-                                                    const leads = (searchRes.data && searchRes.data.data) || [];
-                                                    totalFetched += leads.length;
-                                              
-                                                    if (leads.length === 0) break;
-                                              
-                                                    for (const lead of leads) {
-                                                                    const callCount = parseInt(lead.AI_Call_Count || '0', 10);
-                                                                    const status = (lead.AI_Last_Call_Status || '').trim();
-                                                                    const phone = lead.Phone || '';
-                                                            
-                                                                    // Skip: already at max, terminal status, or no phone
-                                                                    if (callCount >= MAX_CALLS_PER_LEAD) { skipped++; continue; }
-                                                                    if (TERMINAL.includes(status)) { skipped++; continue; }
-                                                                    if (!phone) { skipped++; continue; }
-                                                                    // Skip leads never called (callCount = 0) — they will be triggered by Zoho webhook naturally
-                                                                    if (callCount === 0) { skipped++; continue; }
-                                                            
-                                                                    const leadObj = {
-                                                                                      id: lead.id,
-                                                                                      name: ((lead.First_Name || '') + ' ' + (lead.Last_Name || '')).trim() || 'Valued Lead',
-                                                                                      phone: phone,
-                                                                                      email: lead.Email || '',
-                                                                                      company: lead.Company || ''
-                                                                    };
-                                                            
-                                                                    try {
-                                                                                      const delayMs = getDelayUntilNext9PMIST();
-                                                                                      const fireAt = new Date(Date.now() + delayMs).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '') + ' UTC';
-                                                                                      await safeUpdateZohoLead(lead.id, {
-                                                                                                          AI_Last_Call_Status: 'Follow-Up Scheduled',
-                                                                                                          AI_Follow_Up_Scheduled: fireAt
-                                                                                              });
-                                                                                      scheduleFollowUpCall(leadObj, delayMs);
-                                                                                      console.log(`[requeue] Scheduled lead ${lead.id} (${leadObj.name}) callCount=${callCount} -> 9PM IST today`);
-                                                                                      queued++;
-                                                                    } catch (err) {
-                                                                                      console.error(`[requeue] Failed to schedule lead ${lead.id}:`, err.message);
-                                                                                      errors++;
-                                                                    }
-                                                    }
-                                              
-                                                    // Check if there are more pages
-                                                    const info = searchRes.data && searchRes.data.info;
-                                                    if (!info || !info.more_records) break;
-                                                    page++;
-                                      }
-                          } catch (err) {
-                                      console.error('[requeue] Fatal error fetching leads:', err.message);
-                                      return res.status(500).json({ error: 'Failed to fetch leads', details: err.message, queued, skipped, errors });
-                          }
-                        
-                          console.log(`[requeue] Done. Total fetched=${totalFetched}, queued=${queued}, skipped=${skipped}, errors=${errors}`);
-                          return res.json({ success: true, totalFetched, queued, skipped, errors });
-                });
-        
-        service: 'zoho-retell-middleware',
-                  timestamp: new Date().toISOString()
+                  service: 'zoho-retell-middleware',
+                        timestamp: new Date().toISOString()
         });
 });
+
+// --- Daily 9PM IST Auto-Requeue: runs every day at 9PM IST automatically forever ---
+// Fetches all leads with AI_Call_Count 1 or 2 and schedules their next call immediately
+// Skips: Interested, Not Interested, Completed, Max Calls Reached, no phone, never called
+async function runDailyRequeue() {
+          const TERMINAL = ['Interested', 'Not Interested', 'Completed', 'Max Calls Reached'];
+          const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
+          let page = 1;
+          const perPage = 200;
+          let queued = 0, skipped = 0, errors = 0, totalFetched = 0;
+
+          console.log('[daily-requeue] Starting daily 9PM IST requeue run...');
+          try {
+                      while (true) {
+                                    const token = await getZohoAccessToken();
+                                    const searchRes = await axios.get(baseUrl + '/crm/v3/Leads', {
+                                                    headers: { Authorization: 'Zoho-oauthtoken ' + token },
+                                                    params: {
+                                                                      fields: 'id,First_Name,Last_Name,Phone,Email,Company,AI_Call_Count,AI_Last_Call_Status',
+                                                                      per_page: perPage,
+                                                                      page: page
+                                                    }
+                                    });
+                                    const leads = (searchRes.data && searchRes.data.data) || [];
+                                    totalFetched += leads.length;
+                                    if (leads.length === 0) break;
+
+                                    for (const lead of leads) {
+                                                    const callCount = parseInt(lead.AI_Call_Count || '0', 10);
+                                                    const status = (lead.AI_Last_Call_Status || '').trim();
+                                                    const phone = lead.Phone || '';
+                                                    if (callCount >= MAX_CALLS_PER_LEAD) { skipped++; continue; }
+                                                    if (TERMINAL.includes(status)) { skipped++; continue; }
+                                                    if (!phone) { skipped++; continue; }
+                                                    if (callCount === 0) { skipped++; continue; }
+
+                                                    const leadObj = {
+                                                                      id: lead.id,
+                                                                      name: ((lead.First_Name || '') + ' ' + (lead.Last_Name || '')).trim() || 'Valued Lead',
+                                                                      phone: phone, email: lead.Email || '', company: lead.Company || ''
+                                                    };
+                                                    try {
+                                                                      const staggerMs = queued * 5000; // 5s stagger between leads
+                                                                      const fireAt = new Date(Date.now() + staggerMs).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '') + ' UTC';
+                                                                      await safeUpdateZohoLead(lead.id, { AI_Last_Call_Status: 'Follow-Up Scheduled', AI_Follow_Up_Scheduled: fireAt });
+                                                                      scheduleFollowUpCall(leadObj, staggerMs);
+                                                                      console.log('[daily-requeue] Queued lead ' + lead.id + ' (' + leadObj.name + ') callCount=' + callCount + ' stagger=' + staggerMs / 1000 + 's');
+                                                                      queued++;
+                                                    } catch (err) {
+                                                                      console.error('[daily-requeue] Failed to queue lead ' + lead.id + ':', err.message);
+                                                                      errors++;
+                                                    }
+                                    }
+                                    const info = searchRes.data && searchRes.data.info;
+                                    if (!info || !info.more_records) break;
+                                    page++;
+                      }
+          } catch (err) {
+                      console.error('[daily-requeue] Fatal error:', err.message);
+    console.log('[server] Health check: GET /health');  scheduleDailyRequeue();
+            console.log('[daily-requeue] Scheduler active: fires every day at 9:00 PM IST');}
+          console.log('[daily-requeue] Done. fetched=' + totalFetched + ' queued=' + queued + ' skipped=' + skipped + ' errors=' + errors);
+}
+
+// Schedules runDailyRequeue to fire at 9PM IST every day forever (self-rescheduling)
+function scheduleDailyRequeue() {
+          const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+          const nowUTC = Date.now();
+          const nowIST = new Date(nowUTC + IST_OFFSET_MS);
+          const target = new Date(nowIST);
+          target.setHours(21, 0, 0, 0); // 9:00 PM IST
+          if (target.getTime() <= nowIST.getTime()) target.setDate(target.getDate() + 1);
+          const targetUTC = target.getTime() - IST_OFFSET_MS;
+          const delayMs = targetUTC - nowUTC;
+          console.log('[daily-requeue] Next auto-requeue at: ' + new Date(targetUTC).toISOString() + ' (in ' + Math.round(delayMs / 60000) + ' min)');
+          setTimeout(async function() {
+                      await runDailyRequeue();
+                      scheduleDailyRequeue(); // reschedule for the next day
+          }, delayMs);
+}
 
 // Start Server
 const port = PORT || 3000;
@@ -591,11 +583,13 @@ app.listen(port, () => {
         console.log('[server] zoho-retell-middleware running on port ' + port);
         console.log('[server] Retell webhook: POST /webhook/retell-callback');
         console.log('[server] Zoho webhook: POST /webhook/zoho-lead');
-        console.log('[server] Health check: GET /health');
+        console.log('[server] Health check: GET /health')
+                    scheduleDailyRequeue();
 });
 
 // --- OAuth Callback: Exchange code for refresh token ---
-app.get('/oauth/callback', async (req, res) => {
+app.get('/oauth/callback', async (req, res) =>
+          scheduleDailyRequeue();
         const code = req.query.code;
         if (!code) return res.status(400).send('No code provided');
         try {
