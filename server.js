@@ -480,7 +480,7 @@ app.post('/webhook/retell-callback', async (req, res) => {
            return res.json({ success: true, leadId, callStatus, outcome, meetingInterested, bookingLinkSent, AI_Call_Count: currentCallCount });
 });
 
-// ONE-TIME MIGRATION: Set AI_Call_Count=1 for all leads that were called before (have AI_Last_Call_Status set but AI_Call_Count is null)app.post('/admin/backfill-call-count', async (req, res) => {
+// ONE-TIME MIGRATION: Set AI_Call_Count=1 for all leads that were called before (have AI_Last_Call_Status set but AI_Call_Count is nuapp.post('/admin/backfill-call-count', async (req, res) => {
 app.get('/health', (req, res) => {
           res.json({
                       status: 'ok',
