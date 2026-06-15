@@ -47,7 +47,7 @@ async function getZohoAccessToken() {
           return cachedToken;
 }
 
-// --- Zoho CRM: Fetch Lead Fields ---
+// --- Zoho CRM: Fetch Lead ---
 async function getZohoLead(leadId) {
           const token = await getZohoAccessToken();
           const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
@@ -219,23 +219,18 @@ const MAX_CALLS_PER_LEAD = 3;
 
 // --- Compute delay (ms) until next 3:30 AM IST ---
 // 3:30 AM IST = 22:00 UTC (previous calendar day)
-// IST = UTC+5:30, so 3:30 AM IST - 5:30 = 22:00 UTC
-// In pure UTC math: midnight IST + 3.5 hours = (midnight_UTC - IST_OFFSET) + 3.5h
+// Pure UTC math: midnight IST + 3.5h = (Date.UTC(y,m,d) - IST_OFFSET) + 3.5h
 function getDelayUntilNext330AMIST() {
-          const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // 19800000 ms
-const THREE_THIRTY_AM_MS = 3.5 * 60 * 60 * 1000; // 3.5 hours in ms
-const nowUTC = Date.now();
-          // Get current IST date components
-const nowISTDate = new Date(nowUTC + IST_OFFSET_MS);
+          const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+          const THREE_THIRTY_AM_MS = 3.5 * 60 * 60 * 1000;
+          const nowUTC = Date.now();
+          const nowISTDate = new Date(nowUTC + IST_OFFSET_MS);
           const istYear = nowISTDate.getUTCFullYear();
           const istMonth = nowISTDate.getUTCMonth();
           const istDay = nowISTDate.getUTCDate();
-          // midnight IST today in UTC ms
-const midnightISTtoday_UTC = Date.UTC(istYear, istMonth, istDay) - IST_OFFSET_MS;
-          // 3:30 AM IST today in UTC ms
-const threeThirtyAM_IST_today_UTC = midnightISTtoday_UTC + THREE_THIRTY_AM_MS;
-          // If already past 3:30 AM IST today, schedule for tomorrow
-let target_UTC;
+          const midnightISTtoday_UTC = Date.UTC(istYear, istMonth, istDay) - IST_OFFSET_MS;
+          const threeThirtyAM_IST_today_UTC = midnightISTtoday_UTC + THREE_THIRTY_AM_MS;
+          let target_UTC;
           if (nowUTC < threeThirtyAM_IST_today_UTC) {
                     target_UTC = threeThirtyAM_IST_today_UTC;
           } else {
@@ -254,15 +249,22 @@ async function scheduleFollowUpCall(lead, delayMs) {
                     try {
                               const freshLead = await getZohoLead(lead.id);
                               if (!freshLead) {
-                                        console.warn(`[followup] Lead ${lead.id} not found in CRM, skipping follow-up`);
+                                        console.warn(`[followup] Lead ${lead.id} not found in CRM, skipping`);
                                         return;
                               }
 
                     const callCount = parseInt(freshLead.AI_Call_Count || '0', 10);
                               const currentStatus = (freshLead.AI_Last_Call_Status || '').trim();
+                              const leadStatus = (freshLead.Lead_Status || '').trim();
+
+                    // Skip if lead is now marked as Contacted in Zoho
+                    if (leadStatus === 'Contacted') {
+                              console.log(`[followup] Lead ${lead.id} Lead_Status is "Contacted". Skipping follow-up.`);
+                              return;
+                    }
 
                     if (callCount >= MAX_CALLS_PER_LEAD) {
-                              console.log(`[followup] Lead ${lead.id} has already received ${callCount} call(s) (max=${MAX_CALLS_PER_LEAD}). Skipping follow-up.`);
+                              console.log(`[followup] Lead ${lead.id} already received ${callCount} call(s) (max=${MAX_CALLS_PER_LEAD}). Skipping.`);
                               await safeUpdateZohoLead(lead.id, { AI_Last_Call_Status: 'Max Calls Reached' });
                               return;
                     }
@@ -293,6 +295,7 @@ async function scheduleFollowUpCall(lead, delayMs) {
 }
 
 // ROUTE 1: Zoho CRM Webhook -> Receive new lead -> Trigger Retell AI call
+// Skips leads with Lead_Status = "Contacted" in Zoho
 app.post('/webhook/zoho-lead', async (req, res) => {
           console.log('[zoho-lead] Incoming payload:', JSON.stringify(req.body, null, 2));
 
@@ -310,7 +313,15 @@ app.post('/webhook/zoho-lead', async (req, res) => {
 
          try {
                    const existingLead = await getZohoLead(id);
-                   const callCount = parseInt((existingLead && existingLead.AI_Call_Count) || '0', 10);
+
+          // Skip if Zoho Lead_Status is "Contacted"
+          const zohoLeadStatus = (existingLead && existingLead.Lead_Status) || '';
+                   if (zohoLeadStatus.trim() === 'Contacted') {
+                             console.log(`[zoho-lead] Lead ${id} has Lead_Status="Contacted". Skipping call.`);
+                             return res.json({ success: false, skipped: true, reason: 'Lead status is Contacted' });
+                   }
+
+          const callCount = parseInt((existingLead && existingLead.AI_Call_Count) || '0', 10);
 
           if (callCount >= MAX_CALLS_PER_LEAD) {
                     console.log(`[zoho-lead] Lead ${id} already received ${callCount} call(s) (max=${MAX_CALLS_PER_LEAD}). Skipping.`);
@@ -321,12 +332,12 @@ app.post('/webhook/zoho-lead', async (req, res) => {
                    if (existingStatus && existingStatus.trim() !== '') {
                              const terminalStatuses = ['Interested', 'Not Interested', 'Completed', 'Max Calls Reached'];
                              if (terminalStatuses.includes(existingStatus.trim())) {
-                                       console.log(`[zoho-lead] Lead ${id} has terminal status="${existingStatus}". Skipping.`);
+                                       console.log(`[zoho-lead] Lead ${id} has terminal AI status="${existingStatus}". Skipping.`);
                                        return res.json({ success: false, skipped: true, reason: 'Lead already in terminal status', AI_Last_Call_Status: existingStatus });
                              }
                    }
          } catch (fetchErr) {
-                   console.warn('[zoho-lead] Could not fetch lead status from CRM (proceeding with call):', fetchErr.message);
+                   console.warn('[zoho-lead] Could not fetch lead from CRM (proceeding with call):', fetchErr.message);
          }
 
          const lead = {
@@ -454,14 +465,14 @@ app.post('/webhook/retell-callback', async (req, res) => {
 
           if (lead.phone) {
                     const followUpDelayMs = getDelayUntilNext330AMIST();
-                    console.log(`[retell-callback] Lead ${leadId} needs follow-up (status="${callStatus}", outcome="${outcome}", calls so far=${currentCallCount}/${MAX_CALLS_PER_LEAD}). Scheduling for next 3:30AM IST.`);
+                    console.log(`[retell-callback] Lead ${leadId} needs follow-up (status="${callStatus}", calls so far=${currentCallCount}/${MAX_CALLS_PER_LEAD}). Scheduling for next 3:30AM IST.`);
                     await safeUpdateZohoLead(leadId, {
                               AI_Last_Call_Status: 'Follow-Up Scheduled',
                               AI_Follow_Up_Scheduled: new Date(Date.now() + followUpDelayMs).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
                     });
                     scheduleFollowUpCall(lead, followUpDelayMs);
           } else {
-                    console.warn(`[retell-callback] Lead ${leadId} needs follow-up but phone number not available. Skipping schedule.`);
+                    console.warn(`[retell-callback] Lead ${leadId} needs follow-up but phone number not available. Skipping.`);
           }
          } else if (needsFollowUp && currentCallCount >= MAX_CALLS_PER_LEAD) {
                    console.log(`[retell-callback] Lead ${leadId} needs follow-up but max calls (${MAX_CALLS_PER_LEAD}) reached. Marking as Max Calls Reached.`);
@@ -481,6 +492,7 @@ app.post('/webhook/retell-callback', async (req, res) => {
 });
 
 // ONE-TIME MIGRATION: Set AI_Call_Count=1 for all leads that were called before
+// Skips leads with Lead_Status = "Contacted"
 app.post('/admin/backfill-call-count', async (req, res) => {
           if (req.body.secret !== WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' });
           const CALLED_STATUSES = ['No Answer', 'Voicemail', 'Callback Requested', 'Call Initiated', 'Follow-Up Scheduled', 'Completed', 'Failed', 'Busy', 'Call Failed'];
@@ -491,14 +503,16 @@ app.post('/admin/backfill-call-count', async (req, res) => {
                               const token = await getZohoAccessToken();
                               const r = await axios.get(baseUrl + '/crm/v3/Leads', {
                                         headers: { Authorization: 'Zoho-oauthtoken ' + token },
-                                        params: { fields: 'id,First_Name,Last_Name,AI_Call_Count,AI_Last_Call_Status', per_page: 200, page }
+                                        params: { fields: 'id,First_Name,Last_Name,AI_Call_Count,AI_Last_Call_Status,Lead_Status', per_page: 200, page }
                               });
                               const leads = (r.data && r.data.data) || [];
                               total += leads.length;
                               if (leads.length === 0) break;
                               for (const lead of leads) {
                                         const status = (lead.AI_Last_Call_Status || '').trim();
+                                        const leadStatus = (lead.Lead_Status || '').trim();
                                         const count = lead.AI_Call_Count;
+                                        if (leadStatus === 'Contacted') { skipped++; continue; }
                                         if (!status || !CALLED_STATUSES.includes(status)) { skipped++; continue; }
                                         if (count !== null && count !== undefined && count !== '' && parseInt(count) > 0) { skipped++; continue; }
                                         try {
@@ -526,9 +540,8 @@ app.get('/health', (req, res) => {
 });
 
 // --- Daily 3:30 AM IST Auto-Requeue ---
-// Runs every day at 3:30 AM IST automatically forever.
-// 3:30 AM IST = 22:00 UTC (previous day)
-// Uses pure UTC math: midnight IST = midnight_UTC - IST_OFFSET, then add 3.5 hours.
+// Skips leads with Lead_Status = "Contacted" in Zoho.
+// Calls everyone else who has AI_Call_Count >= 1 and < MAX and is not terminal.
 async function runDailyRequeue() {
           const TERMINAL = ['Interested', 'Not Interested', 'Completed', 'Max Calls Reached'];
           const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
@@ -543,7 +556,7 @@ console.log('[daily-requeue] Starting daily 3:30AM IST requeue run...');
                               const searchRes = await axios.get(baseUrl + '/crm/v3/Leads', {
                                         headers: { Authorization: 'Zoho-oauthtoken ' + token },
                                         params: {
-                                                  fields: 'id,First_Name,Last_Name,Phone,Email,Company,AI_Call_Count,AI_Last_Call_Status',
+                                                  fields: 'id,First_Name,Last_Name,Phone,Email,Company,AI_Call_Count,AI_Last_Call_Status,Lead_Status',
                                                   per_page: perPage,
                                                   page: page
                                         }
@@ -556,6 +569,14 @@ console.log('[daily-requeue] Starting daily 3:30AM IST requeue run...');
                               const callCount = parseInt(lead.AI_Call_Count || '0', 10);
                               const status = (lead.AI_Last_Call_Status || '').trim();
                               const phone = lead.Phone || '';
+                              const leadStatus = (lead.Lead_Status || '').trim();
+
+                              // Skip leads marked as Contacted in Zoho
+                              if (leadStatus === 'Contacted') {
+                                        console.log('[daily-requeue] Skipping lead ' + lead.id + ' - Lead_Status is Contacted');
+                                        skipped++;
+                                        continue;
+                              }
 
                               if (callCount >= MAX_CALLS_PER_LEAD) { skipped++; continue; }
                               if (TERMINAL.includes(status)) { skipped++; continue; }
@@ -597,23 +618,19 @@ console.log('[daily-requeue] Starting daily 3:30AM IST requeue run...');
 console.log('[daily-requeue] Done. fetched=' + totalFetched + ' queued=' + queued + ' skipped=' + skipped + ' errors=' + errors);
 }
 
-// Self-rescheduling daily trigger at 3:30 AM IST every day.
-// 3:30 AM IST = midnight IST + 3.5h = (midnight_UTC - IST_OFFSET) + 3.5h = 22:00 UTC previous day.
+// Self-rescheduling daily trigger at 3:30 AM IST.
+// 3:30 AM IST = midnight IST + 3.5h = (Date.UTC(y,m,d) - IST_OFFSET) + 3.5h = 22:00 UTC prev day.
 function scheduleDailyRequeue() {
-          const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // 19800000 ms
-const THREE_THIRTY_AM_MS = 3.5 * 60 * 60 * 1000; // 3.5 hours
-const nowUTC = Date.now();
-          // Get IST date components from current UTC time
-const nowISTDate = new Date(nowUTC + IST_OFFSET_MS);
+          const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+          const THREE_THIRTY_AM_MS = 3.5 * 60 * 60 * 1000;
+          const nowUTC = Date.now();
+          const nowISTDate = new Date(nowUTC + IST_OFFSET_MS);
           const istYear = nowISTDate.getUTCFullYear();
           const istMonth = nowISTDate.getUTCMonth();
           const istDay = nowISTDate.getUTCDate();
-          // midnight IST today in UTC ms
-const midnightISTtoday_UTC = Date.UTC(istYear, istMonth, istDay) - IST_OFFSET_MS;
-          // 3:30 AM IST today in UTC ms
-const threeThirtyAM_IST_today_UTC = midnightISTtoday_UTC + THREE_THIRTY_AM_MS;
-          // If already past 3:30 AM IST today, schedule for tomorrow
-let target_UTC;
+          const midnightISTtoday_UTC = Date.UTC(istYear, istMonth, istDay) - IST_OFFSET_MS;
+          const threeThirtyAM_IST_today_UTC = midnightISTtoday_UTC + THREE_THIRTY_AM_MS;
+          let target_UTC;
           if (nowUTC < threeThirtyAM_IST_today_UTC) {
                     target_UTC = threeThirtyAM_IST_today_UTC;
           } else {
@@ -623,7 +640,7 @@ let target_UTC;
           console.log('[daily-requeue] Next auto-requeue at: ' + new Date(target_UTC).toISOString() + ' (3:30 AM IST) in ' + Math.round(delayMs / 60000) + ' min');
           setTimeout(async function() {
                     await runDailyRequeue();
-                    scheduleDailyRequeue(); // reschedule for the next day
+                    scheduleDailyRequeue();
           }, delayMs);
 }
 
@@ -637,7 +654,7 @@ app.listen(port, () => {
           scheduleDailyRequeue();
 });
 
-// --- OAuth Callback: Exchange code for refresh token ---
+// --- OAuth Callback ---
 app.get('/oauth/callback', async (req, res) => {
           const code = req.query.code;
           if (!code) return res.status(400).send('No code provided');
