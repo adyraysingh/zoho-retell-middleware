@@ -215,11 +215,11 @@ async function withRetry(fn, retries, delayMs) {
         }
 }
 
-// --- Schedule a Follow-Up Call for Next Day (24 hours later) ---
+// --- Schedule Follow-Up Calls: today(call1) + tomorrow(call2) + day-after-tomorrow(call3) ---
 // Statuses that are eligible for a follow-up call
 const FOLLOWUP_ELIGIBLE_STATUSES = ['No Answer', 'Voicemail', 'Callback Requested'];
-// Maximum total calls allowed per lead (first call + 1 follow-up = 2 max)
-const MAX_CALLS_PER_LEAD = 2;
+// Maximum total calls allowed per lead (call 1 today + call 2 tomorrow + call 3 day after tomorrow = 3 max)
+const MAX_CALLS_PER_LEAD = 3;
 
 async function scheduleFollowUpCall(lead, delayMs) {
         console.log(`[followup] Scheduling follow-up call for lead ${lead.id} (${lead.name}) in ${delayMs / 3600000} hour(s)`);
@@ -442,7 +442,7 @@ app.post('/webhook/retell-callback', async (req, res) => {
                      };
 
           if (lead.phone) {
-                      // Schedule follow-up for 24 hours later (next day same time)
+                      // Schedule next follow-up 24h later (call2=tomorrow, call3=day-after-tomorrow)
                        const followUpDelayMs = 24 * 60 * 60 * 1000; // 24 hours
                        console.log(`[retell-callback] Lead ${leadId} needs follow-up (status="${callStatus}", outcome="${outcome}", calls so far=${currentCallCount}/${MAX_CALLS_PER_LEAD}). Scheduling for tomorrow.`);
                       await safeUpdateZohoLead(leadId, {
