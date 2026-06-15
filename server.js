@@ -480,7 +480,42 @@ app.post('/webhook/retell-callback', async (req, res) => {
            return res.json({ success: true, leadId, callStatus, outcome, meetingInterested, bookingLinkSent, AI_Call_Count: currentCallCount });
 });
 
-// ONE-TIME MIGRATION: Set AI_Call_Count=1 for all leads that were called before (have AI_Last_Call_Status set but AI_Call_Count is nuapp.post('/admin/backfill-call-count', async (req, res) => {
+// ONE-TIME MIGRATION: Set AI_Call_Count=1 for all leads that were called before (have AI_Last_Call_Status set but AI_Call_Count is nuapapp.post('/admin/backfill-call-count', async (req, res) => {
+apapp.post('/admin/backfill-call-count', async (req, res) => {
+            if (req.body.secret !== WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' });
+            const CALLED_STATUSES = ['No Answer', 'Voicemail', 'Callback Requested', 'Call Initiated', 'Follow-Up Scheduled', 'Completed', 'Failed', 'Busy', 'Call Failed'];
+            const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
+            let page = 1, updated = 0, skipped = 0, errors = 0, total = 0;
+            try {
+                          while (true) {
+                                          const token = await getZohoAccessToken();
+                                          const r = await axios.get(baseUrl + '/crm/v3/Leads', {
+                                                            headers: { Authorization: 'Zoho-oauthtoken ' + token },
+                                                            params: { fields: 'id,First_Name,Last_Name,AI_Call_Count,AI_Last_Call_Status', per_page: 200, page }
+                                          });
+                                          const leads = (r.data && r.data.data) || [];
+                                          total += leads.length;
+                                          if (leads.length === 0) break;
+                                          for (const lead of leads) {
+                                                            const status = (lead.AI_Last_Call_Status || '').trim();
+                                                            const count = lead.AI_Call_Count;
+                                                            if (!status || !CALLED_STATUSES.includes(status)) { skipped++; continue; }
+                                                            if (count !== null && count !== undefined && count !== '' && parseInt(count) > 0) { skipped++; continue; }
+                                                            try {
+                                                                                await updateZohoLead(lead.id, { AI_Call_Count: 1 });
+                                                                                console.log('[backfill] Set AI_Call_Count=1 for ' + (lead.First_Name||'') + ' ' + (lead.Last_Name||'') + ' status=' + status);
+                                                                                updated++;
+                                                                                await new Promise(resolve => setTimeout(resolve, 200));
+                                                            } catch (e) { console.error('[backfill] Failed for lead ' + lead.id + ':', e.message); errors++; }
+                                          }
+                                          const info = r.data && r.data.info;
+                                          if (!info || !info.more_records) break;
+                                          page++;
+                          }
+            } catch (e) { console.error('[backfill] Fatal:', e.message); }
+            console.log('[backfill] Done. total=' + total + ' updated=' + updated + ' skipped=' + skipped + ' errors=' + errors);
+            res.json({ success: true, total, updated, skipped, errors });
+});
 app.get('/health', (req, res) => {
           res.json({
                       status: 'ok',
