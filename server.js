@@ -1,4 +1,4 @@
-'use strict';
+use strict';
 require('dotenv').config();
 
 const express = require('express');
@@ -217,35 +217,32 @@ async function withRetry(fn, retries, delayMs) {
 const FOLLOWUP_ELIGIBLE_STATUSES = ['No Answer', 'Voicemail', 'Callback Requested'];
 const MAX_CALLS_PER_LEAD = 3;
 
-// --- Compute delay (ms) until next 9:00 PM IST ---
-// FIX: Work entirely in UTC milliseconds. IST = UTC+5:30.
-// 9:00 PM IST = 15:30 UTC (21:00 - 5:30 = 15:30)
-function getDelayUntilNext9PMIST() {
+// --- Compute delay (ms) until next 3:30 AM IST ---
+// 3:30 AM IST = 22:00 UTC (previous calendar day)
+// IST = UTC+5:30, so 3:30 AM IST - 5:30 = 22:00 UTC
+// In pure UTC math: midnight IST + 3.5 hours = (midnight_UTC - IST_OFFSET) + 3.5h
+function getDelayUntilNext330AMIST() {
           const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // 19800000 ms
+const THREE_THIRTY_AM_MS = 3.5 * 60 * 60 * 1000; // 3.5 hours in ms
 const nowUTC = Date.now();
-          // Current time expressed as IST milliseconds-since-epoch
-const nowIST_ms = nowUTC + IST_OFFSET_MS;
-          // IST date components
-const nowISTDate = new Date(nowIST_ms);
-          // Build today's 9 PM IST as a UTC timestamp:
-// Take the UTC date that corresponds to today in IST, set hours to 21 in IST (= 15:30 UTC)
-// We do this by getting start-of-day in IST (midnight IST = midnight UTC - IST_OFFSET_MS)
-const istYear = nowISTDate.getUTCFullYear();
+          // Get current IST date components
+const nowISTDate = new Date(nowUTC + IST_OFFSET_MS);
+          const istYear = nowISTDate.getUTCFullYear();
           const istMonth = nowISTDate.getUTCMonth();
           const istDay = nowISTDate.getUTCDate();
-          // midnight IST today in UTC ms:
+          // midnight IST today in UTC ms
 const midnightISTtoday_UTC = Date.UTC(istYear, istMonth, istDay) - IST_OFFSET_MS;
-          // 9 PM IST today in UTC ms: midnight IST + 21 hours
-const ninepmIST_today_UTC = midnightISTtoday_UTC + (21 * 60 * 60 * 1000);
-          // If we've already passed 9 PM IST today, schedule for tomorrow
+          // 3:30 AM IST today in UTC ms
+const threeThirtyAM_IST_today_UTC = midnightISTtoday_UTC + THREE_THIRTY_AM_MS;
+          // If already past 3:30 AM IST today, schedule for tomorrow
 let target_UTC;
-          if (nowUTC < ninepmIST_today_UTC) {
-                    target_UTC = ninepmIST_today_UTC;
+          if (nowUTC < threeThirtyAM_IST_today_UTC) {
+                    target_UTC = threeThirtyAM_IST_today_UTC;
           } else {
-                    target_UTC = ninepmIST_today_UTC + (24 * 60 * 60 * 1000);
+                    target_UTC = threeThirtyAM_IST_today_UTC + (24 * 60 * 60 * 1000);
           }
           const delayMs = target_UTC - nowUTC;
-          const fireAt = new Date(target_UTC).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '') + ' UTC (9:00 PM IST)';
+          const fireAt = new Date(target_UTC).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '') + ' UTC (3:30 AM IST)';
           console.log('[followup] Next call scheduled at: ' + fireAt + ' (delay=' + Math.round(delayMs / 60000) + ' min)');
           return delayMs;
 }
@@ -456,8 +453,8 @@ app.post('/webhook/retell-callback', async (req, res) => {
                    };
 
           if (lead.phone) {
-                    const followUpDelayMs = getDelayUntilNext9PMIST();
-                    console.log(`[retell-callback] Lead ${leadId} needs follow-up (status="${callStatus}", outcome="${outcome}", calls so far=${currentCallCount}/${MAX_CALLS_PER_LEAD}). Scheduling for next 9PM IST.`);
+                    const followUpDelayMs = getDelayUntilNext330AMIST();
+                    console.log(`[retell-callback] Lead ${leadId} needs follow-up (status="${callStatus}", outcome="${outcome}", calls so far=${currentCallCount}/${MAX_CALLS_PER_LEAD}). Scheduling for next 3:30AM IST.`);
                     await safeUpdateZohoLead(leadId, {
                               AI_Last_Call_Status: 'Follow-Up Scheduled',
                               AI_Follow_Up_Scheduled: new Date(Date.now() + followUpDelayMs).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
@@ -528,9 +525,10 @@ app.get('/health', (req, res) => {
           });
 });
 
-// --- Daily 9PM IST Auto-Requeue ---
-// FIX: Correctly computes 9 PM IST using pure UTC math (no setHours bug).
-// IST = UTC+5:30. 9 PM IST = 15:30 UTC.
+// --- Daily 3:30 AM IST Auto-Requeue ---
+// Runs every day at 3:30 AM IST automatically forever.
+// 3:30 AM IST = 22:00 UTC (previous day)
+// Uses pure UTC math: midnight IST = midnight_UTC - IST_OFFSET, then add 3.5 hours.
 async function runDailyRequeue() {
           const TERMINAL = ['Interested', 'Not Interested', 'Completed', 'Max Calls Reached'];
           const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
@@ -538,7 +536,7 @@ async function runDailyRequeue() {
           const perPage = 200;
           let queued = 0, skipped = 0, errors = 0, totalFetched = 0;
 
-console.log('[daily-requeue] Starting daily 9PM IST requeue run...');
+console.log('[daily-requeue] Starting daily 3:30AM IST requeue run...');
           try {
                     while (true) {
                               const token = await getZohoAccessToken();
@@ -599,30 +597,30 @@ console.log('[daily-requeue] Starting daily 9PM IST requeue run...');
 console.log('[daily-requeue] Done. fetched=' + totalFetched + ' queued=' + queued + ' skipped=' + skipped + ' errors=' + errors);
 }
 
-// Self-rescheduling daily trigger: fires runDailyRequeue at 9PM IST every day forever
-// FIX: Uses pure UTC math to compute next 9 PM IST correctly.
-// 9 PM IST = midnight IST + 21 hours = (midnight UTC - IST_OFFSET) + 21h
+// Self-rescheduling daily trigger at 3:30 AM IST every day.
+// 3:30 AM IST = midnight IST + 3.5h = (midnight_UTC - IST_OFFSET) + 3.5h = 22:00 UTC previous day.
 function scheduleDailyRequeue() {
           const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // 19800000 ms
+const THREE_THIRTY_AM_MS = 3.5 * 60 * 60 * 1000; // 3.5 hours
 const nowUTC = Date.now();
-          // Get current IST date components by treating (nowUTC + offset) as a UTC date
+          // Get IST date components from current UTC time
 const nowISTDate = new Date(nowUTC + IST_OFFSET_MS);
           const istYear = nowISTDate.getUTCFullYear();
           const istMonth = nowISTDate.getUTCMonth();
           const istDay = nowISTDate.getUTCDate();
-          // midnight IST today expressed in UTC ms
+          // midnight IST today in UTC ms
 const midnightISTtoday_UTC = Date.UTC(istYear, istMonth, istDay) - IST_OFFSET_MS;
-          // 9 PM IST today in UTC ms
-const ninepmIST_today_UTC = midnightISTtoday_UTC + (21 * 60 * 60 * 1000);
-          // If we already passed 9 PM IST today, schedule for tomorrow
+          // 3:30 AM IST today in UTC ms
+const threeThirtyAM_IST_today_UTC = midnightISTtoday_UTC + THREE_THIRTY_AM_MS;
+          // If already past 3:30 AM IST today, schedule for tomorrow
 let target_UTC;
-          if (nowUTC < ninepmIST_today_UTC) {
-                    target_UTC = ninepmIST_today_UTC;
+          if (nowUTC < threeThirtyAM_IST_today_UTC) {
+                    target_UTC = threeThirtyAM_IST_today_UTC;
           } else {
-                    target_UTC = ninepmIST_today_UTC + (24 * 60 * 60 * 1000);
+                    target_UTC = threeThirtyAM_IST_today_UTC + (24 * 60 * 60 * 1000);
           }
           const delayMs = target_UTC - nowUTC;
-          console.log('[daily-requeue] Next auto-requeue at: ' + new Date(target_UTC).toISOString() + ' (9:00 PM IST) in ' + Math.round(delayMs / 60000) + ' min');
+          console.log('[daily-requeue] Next auto-requeue at: ' + new Date(target_UTC).toISOString() + ' (3:30 AM IST) in ' + Math.round(delayMs / 60000) + ' min');
           setTimeout(async function() {
                     await runDailyRequeue();
                     scheduleDailyRequeue(); // reschedule for the next day
