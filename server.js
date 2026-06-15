@@ -271,7 +271,7 @@ async function scheduleFollowUpCall(lead, delayMs) {
                         await safeUpdateZohoLead(lead.id, {
                                         AI_Last_Call_Status: 'Call Initiated',
                                         AI_Last_Call_Date: new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ''),
-                                        AI_Call_Count: String(callCount + 1)
+                                        AI_Call_Count: callCount + 1
                         });
 
                       } catch (err) {
@@ -346,7 +346,7 @@ app.post('/webhook/zoho-lead', async (req, res) => {
                           await safeUpdateZohoLead(id, {
                                           AI_Last_Call_Status: 'Call Initiated',
                                           AI_Last_Call_Date: new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ''),
-                                          AI_Call_Count: String(newCallCount)
+                                          AI_Call_Count: newCallCount
                           });
             } catch (crmErr) {
                           console.warn('[zoho-lead] CRM status update failed (non-fatal):', crmErr.message);
@@ -425,7 +425,7 @@ app.post('/webhook/retell-callback', async (req, res) => {
                        Call_Summary: transcript.slice(0, 2000),
                        Recording_URL: recordingUrl,
                        Transcript_URL: transcriptUrl,
-                       AI_Call_Count: String(currentCallCount)
+                       AI_Call_Count: currentCallCount
            });
 
            console.log('[retell-callback] CRM update completed');
