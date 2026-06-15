@@ -480,8 +480,8 @@ app.post('/webhook/retell-callback', async (req, res) => {
            return res.json({ success: true, leadId, callStatus, outcome, meetingInterested, bookingLinkSent, AI_Call_Count: currentCallCount });
 });
 
-// ONE-TIME MIGRATION: Set AI_Call_Count=1 for all leads that were called before (have AI_Last_Call_Status set but AI_Call_Count is nuapapp.post('/admin/backfill-call-count', async (req, res) => {
-apapp.post('/admin/backfill-call-count', async (req, res) => {
+// ONE-TIME MIGRATION: Set AI_Call_Count=1 for all leads that were called before (have AI_Last_Call_Status set but AI_Call_Count is nuapp.post('/admin/backfill-call-count', async (req, res) => {
+app.post('/admin/backfill-call-count', async (req, res) => {
             if (req.body.secret !== WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' });
             const CALLED_STATUSES = ['No Answer', 'Voicemail', 'Callback Requested', 'Call Initiated', 'Follow-Up Scheduled', 'Completed', 'Failed', 'Busy', 'Call Failed'];
             const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
