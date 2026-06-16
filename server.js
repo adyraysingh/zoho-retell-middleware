@@ -102,7 +102,7 @@ async function updateZohoLead(leadId, fields) {
 // --- Zoho CRM: Safe update splitting free-text and pick-list fields ---
 async function safeUpdateZohoLead(leadId, fields) {
           const safeFields = {};
-          const picklistFields = ['AI_Last_Call_Status', 'Call_Outcome', 'Meeting_Interested', 'Booking_Link_Sent', 'Lead_Status'];
+          const picklistFields = ['AI_Last_Call_Status', 'Call_Outcome', 'Meeting_Interested', 'Booking_Link_Sent'];
 
 for (const [key, value] of Object.entries(fields)) {
           if (!picklistFields.includes(key)) {
@@ -217,33 +217,6 @@ async function withRetry(fn, retries, delayMs) {
 const FOLLOWUP_ELIGIBLE_STATUSES = ['No Answer', 'Voicemail', 'Callback Requested', 'Follow-Up Scheduled'];
 const MAX_CALLS_PER_LEAD = 3;
 
-// --- Map AI call status to Zoho Lead_Status (Basic Information) ---
-// Called when a call is INITIATED (new or follow-up) -> "Attempted to Contact"
-// Called when a call ENDS and was answered/completed -> "Contacted"
-// Called when no answer / voicemail / failed -> "Attempted to Contact"
-function getZohoLeadStatus(aiCallStatus) {
-          switch (aiCallStatus) {
-                    case 'Call Initiated':
-                              return 'Attempted to Contact';
-                    case 'Completed':
-                              return 'Contacted';
-                    case 'No Answer':
-                              return 'Attempted to Contact';
-                    case 'Voicemail':
-                              return 'Attempted to Contact';
-                    case 'Failed':
-                    case 'Call Failed':
-                              return 'Attempted to Contact';
-                    case 'Callback Requested':
-                              return 'Attempted to Contact';
-                    case 'Follow-Up Scheduled':
-                              return 'Attempted to Contact';
-                    case 'Max Calls Reached':
-                              return 'Attempted to Contact';
-                    default:
-                              return null; // don't update if unknown
-          }
-}
 
 // --- Compute delay (ms) until next 3:30 AM IST ---
 // 3:30 AM IST = 22:00 UTC previous calendar day
@@ -293,7 +266,7 @@ async function scheduleFollowUpCall(lead, delayMs) {
 
                     if (callCount >= MAX_CALLS_PER_LEAD) {
                               console.log(`[followup] Lead ${lead.id} already received ${callCount} call(s) (max=${MAX_CALLS_PER_LEAD}). Skipping.`);
-                              await safeUpdateZohoLead(lead.id, { AI_Last_Call_Status: 'Max Calls Reached', Lead_Status: 'Attempted to Contact' });
+                              await safeUpdateZohoLead(lead.id, { AI_Last_Call_Status: 'Max Calls Reached' });
                               return;
                     }
 
@@ -309,14 +282,13 @@ async function scheduleFollowUpCall(lead, delayMs) {
                     await safeUpdateZohoLead(lead.id, {
                               AI_Last_Call_Status: 'Call Initiated',
                               AI_Last_Call_Date: new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ''),
-                              AI_Call_Count: callCount + 1,
-                              Lead_Status: 'Attempted to Contact'
+                              AI_Call_Count: callCount + 1
                     });
 
                     } catch (err) {
                               console.error(`[followup] Follow-up call failed for lead ${lead.id}:`, err.response ? err.response.data : err.message);
                               try {
-                                        await safeUpdateZohoLead(lead.id, { AI_Last_Call_Status: 'Call Failed', Lead_Status: 'Attempted to Contact' });
+                                        await safeUpdateZohoLead(lead.id, { AI_Last_Call_Status: 'Call Failed' });
                               } catch (e) {
                                         console.error(`[followup] Could not update CRM after follow-up failure:`, e.message);
                               }
@@ -326,7 +298,6 @@ async function scheduleFollowUpCall(lead, delayMs) {
 
 // ROUTE 1: Zoho CRM Webhook -> Receive new lead -> Trigger Retell AI call
 // Skips leads with Lead_Status = "Contacted"
-// Sets Lead_Status = "Attempted to Contact" when call is placed
 app.post('/webhook/zoho-lead', async (req, res) => {
           console.log('[zoho-lead] Incoming payload:', JSON.stringify(req.body, null, 2));
 
@@ -395,8 +366,7 @@ app.post('/webhook/zoho-lead', async (req, res) => {
                    await safeUpdateZohoLead(id, {
                              AI_Last_Call_Status: 'Call Initiated',
                              AI_Last_Call_Date: new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ''),
-                             AI_Call_Count: newCallCount,
-                             Lead_Status: 'Attempted to Contact'
+                             AI_Call_Count: newCallCount
                    });
           } catch (crmErr) {
                     console.warn('[zoho-lead] CRM status update failed (non-fatal):', crmErr.message);
@@ -407,7 +377,7 @@ app.post('/webhook/zoho-lead', async (req, res) => {
          } catch (err) {
                    console.error('[zoho-lead] Failed to place call:', err.response ? err.response.data : err.message);
                    try {
-                             await safeUpdateZohoLead(id, { AI_Last_Call_Status: 'Call Failed', Lead_Status: 'Attempted to Contact' });
+                             await safeUpdateZohoLead(id, { AI_Last_Call_Status: 'Call Failed' });
                    } catch (updateErr) {
                              console.error('[zoho-lead] Failed to update CRM status:', updateErr.message);
                    }
@@ -461,7 +431,7 @@ app.post('/webhook/retell-callback', async (req, res) => {
          // Completed = answered = "Contacted"; anything else = "Attempted to Contact"
          const zohoLeadStatus = getZohoLeadStatus(callStatus);
 
-         console.log('[retell-callback] leadId=' + leadId + ' status=' + callStatus + ' outcome=' + outcome + ' Lead_Status=' + zohoLeadStatus);
+         console.log('[retell-callback] leadId=' + leadId + ' status=' + callStatus + ' outcome=' + outcome);
 
          let currentCallCount = 1;
           let leadPhone = '';
@@ -490,7 +460,7 @@ app.post('/webhook/retell-callback', async (req, res) => {
           if (zohoLeadStatus) updateFields.Lead_Status = zohoLeadStatus;
 
          await safeUpdateZohoLead(leadId, updateFields);
-          console.log('[retell-callback] CRM update completed. Lead_Status set to: ' + (zohoLeadStatus || 'unchanged'));
+          console.log('[retell-callback] CRM update completed.');
 
          try {
                    const callDate = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
@@ -524,7 +494,7 @@ app.post('/webhook/retell-callback', async (req, res) => {
           }
          } else if (needsFollowUp && currentCallCount >= MAX_CALLS_PER_LEAD) {
                    console.log(`[retell-callback] Lead ${leadId} max calls (${MAX_CALLS_PER_LEAD}) reached. Marking Max Calls Reached.`);
-                   await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: 'Max Calls Reached', Lead_Status: 'Attempted to Contact' });
+                   await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: 'Max Calls Reached' });
          }
 
          if (meetingInterested === 'Yes' && leadEmail) {
@@ -536,7 +506,7 @@ app.post('/webhook/retell-callback', async (req, res) => {
                    }
          }
 
-         return res.json({ success: true, leadId, callStatus, outcome, meetingInterested, bookingLinkSent, AI_Call_Count: currentCallCount, Lead_Status: zohoLeadStatus });
+         return res.json({ success: true, leadId, callStatus, outcome, meetingInterested, bookingLinkSent, AI_Call_Count: currentCallCount });
 });
 
 // ONE-TIME MIGRATION: Set AI_Call_Count=1 for all leads that were called before
