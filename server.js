@@ -8,7 +8,7 @@ const app = express();
 app.use(express.json());
 
 // --- Environment Variables ---
-const {
+const 
           RETELL_API_KEY,
           RETELL_AGENT_ID,
           RETELL_FROM_NUMBER,
@@ -442,10 +442,15 @@ app.post('/webhook/retell-callback', async (req, res) => {
                    return res.status(400).json({ error: 'lead_id missing in call variables' });
          }
 
+         // FIX: A call is 'Completed' (human answered) only when transcript has real content (>=50 chars)
+         // Without this check, voicemails ending with user_hangup were wrongly marked 'Contacted'
          let callStatus = 'Completed';
-          if (disconnectReason === 'machine_detected') callStatus = 'Voicemail';
-          else if (disconnectReason === 'dial_no_answer') callStatus = 'No Answer';
-          else if (disconnectReason === 'dial_failed') callStatus = 'Failed';
+         if (disconnectReason === 'machine_detected') callStatus = 'Voicemail';
+         else if (disconnectReason === 'dial_no_answer') callStatus = 'No Answer';
+         else if (disconnectReason === 'dial_failed') callStatus = 'Failed';
+         else if (disconnectReason === 'voicemail_reached') callStatus = 'Voicemail';
+         else if (disconnectReason === 'no_answer') callStatus = 'No Answer';
+         else if (transcript.trim().length < 50) callStatus = 'No Answer';
 
          const analysis = analyzeTranscript(transcript);
           const outcome = analysis.outcome;
