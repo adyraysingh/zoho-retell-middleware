@@ -214,7 +214,7 @@ async function withRetry(fn, retries, delayMs) {
 }
 
 // --- Call scheduling constants ---
-const FOLLOWUP_ELIGIBLE_STATUSES = ['No Answer', 'Voicemail', 'Callback Requested'];
+const FOLLOWUP_ELIGIBLE_STATUSES = ['No Answer', 'Voicemail', 'Callback Requested', 'Follow-Up Scheduled'];
 const MAX_CALLS_PER_LEAD = 3;
 
 // --- Map AI call status to Zoho Lead_Status (Basic Information) ---
@@ -647,6 +647,7 @@ console.log('[daily-requeue] Starting daily 3:30AM IST requeue run...');
 
                     const info = searchRes.data && searchRes.data.info;
                               if (!info || !info.more_records) break;
+                              if (totalFetched >= 2000) { console.log('[daily-requeue] Reached Zoho 2000-record limit, stopping.'); break; }
                               page++;
                     }
           } catch (err) {
