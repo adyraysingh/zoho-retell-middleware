@@ -3,7 +3,6 @@ require('dotenv').config();
 
 const express = require('express');
 const axios   = require('axios');
-const crypto  = require('crypto');
 
 const app = express();
 app.use(express.json());
@@ -19,7 +18,6 @@ const {
   ZOHO_API_DOMAIN,
   WEBHOOK_SECRET,
   RESEND_API_KEY,
-  RETELL_WEBHOOK_SECRET,   // Retell HMAC secret (from Retell dashboard)
   PORT
 } = process.env;
 
@@ -461,21 +459,6 @@ app.post('/webhook/zoho-lead', async (req, res) => {
 // Lead_Status is NEVER touched by this route.
 // ═══════════════════════════════════════════════════════════════════════════════
 app.post('/webhook/retell-callback', async (req, res) => {
-  // Retell HMAC verification — enforced if RETELL_WEBHOOK_SECRET is set,
-  // otherwise logged as a warning and allowed through (so CRM always updates).
-  if (RETELL_WEBHOOK_SECRET) {
-    const sig      = req.headers['x-retell-signature'] || '';
-    const payload  = JSON.stringify(req.body);
-    const expected = crypto.createHmac('sha256', RETELL_WEBHOOK_SECRET).update(payload).digest('hex');
-    if (sig !== expected) {
-      console.error('[retell-callback] Invalid HMAC signature — request rejected');
-      return res.status(401).json({ error: 'Invalid signature' });
-    }
-    console.log('[retell-callback] HMAC signature verified');
-  } else {
-    console.warn('[retell-callback] RETELL_WEBHOOK_SECRET not set — skipping signature check (set it in Railway for security)');
-  }
-
   const { event, call } = req.body || {};
   console.log('[retell-callback] event=' + event);
   if (event !== 'call_ended') return res.json({ ignored: true, event });
