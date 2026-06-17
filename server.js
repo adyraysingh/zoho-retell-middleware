@@ -102,7 +102,7 @@ async function updateZohoLead(leadId, fields) {
 // --- Zoho CRM: Safe update splitting free-text and pick-list fields ---
 async function safeUpdateZohoLead(leadId, fields) {
           const safeFields = {};
-          const picklistFields = ['AI_Last_Call_Status', 'Call_Outcome', 'Meeting_Interested', 'Booking_Link_Sent'];
+          const picklistFields = ['AI_Last_Call_Status', 'Call_Outcome', 'Meeting_Interested', 'Booking_Link_Sent', 'Lead_Status'];
 
 for (const [key, value] of Object.entries(fields)) {
           if (!picklistFields.includes(key)) {
@@ -214,7 +214,7 @@ async function withRetry(fn, retries, delayMs) {
 }
 
 // --- Call scheduling constants ---
-const FOLLOWUP_ELIGIBLE_STATUSES = ['No Answer', 'Voicemail', 'Callback Requested', 'Follow-Up Scheduled'];
+const FOLLOWUP_ELIGIBLE_STATUSES = ['No Answer', 'Voicemail', 'Callback Requested', 'Follow-Up Scheduled', 'Call Initiated', 'Failed'];
 const MAX_CALLS_PER_LEAD = 3;
 
 
@@ -282,7 +282,8 @@ async function scheduleFollowUpCall(lead, delayMs) {
                     await safeUpdateZohoLead(lead.id, {
                               AI_Last_Call_Status: 'Call Initiated',
                               AI_Last_Call_Date: new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ''),
-                              AI_Call_Count: callCount + 1
+                              AI_Call_Count: callCount + 1,
+                              Lead_Status: 'Attempted to Contact'
                     });
 
                     } catch (err) {
@@ -332,7 +333,7 @@ app.post('/webhook/zoho-lead', async (req, res) => {
 
           const existingStatus = existingLead && existingLead.AI_Last_Call_Status;
                    if (existingStatus && existingStatus.trim() !== '') {
-                             const terminalStatuses = ['Interested', 'Not Interested', 'Completed', 'Max Calls Reached'];
+                             const terminalStatuses = ['Interested', 'Not Interested', 'Max Calls Reached'];
                              if (terminalStatuses.includes(existingStatus.trim())) {
                                        console.log(`[zoho-lead] Lead ${id} has terminal AI status="${existingStatus}". Skipping.`);
                                        return res.json({ success: false, skipped: true, reason: 'Lead already in terminal status', AI_Last_Call_Status: existingStatus });
@@ -362,11 +363,12 @@ app.post('/webhook/zoho-lead', async (req, res) => {
                    } catch (e) { /* use default */ }
 
           try {
-                    // New lead call -> Lead_Status = "Attempted to Contact"
+                    // New lead call -> set Lead_Status = "Attempted to Contact"
                    await safeUpdateZohoLead(id, {
                              AI_Last_Call_Status: 'Call Initiated',
                              AI_Last_Call_Date: new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ''),
-                             AI_Call_Count: newCallCount
+                             AI_Call_Count: newCallCount,
+                             Lead_Status: 'Attempted to Contact'
                    });
           } catch (crmErr) {
                     console.warn('[zoho-lead] CRM status update failed (non-fatal):', crmErr.message);
@@ -392,127 +394,141 @@ function getZohoLeadStatus(callStatus) {
 }
 
 // ROUTE 2: Retell AI Post-Call Webhook -> Update CRM + Schedule follow-up + Send Email
-// Updates Lead_Status based on call outcome:
-//   - Call answered / completed -> "Contacted"
-//   - No answer / voicemail / failed -> "Attempted to Contact"
+// Updates Lead_Status: Completed -> "Contacted", anything else -> "Attempted to Contact"
+// Responds immediately (200) then does all CRM work asynchronously to prevent Retell retries.
 app.post('/webhook/retell-callback', async (req, res) => {
-          console.log('[retell-callback] Incoming event:', req.body && req.body.event);
+  console.log('[retell-callback] Incoming event:', req.body && req.body.event);
 
-         const { event, call } = req.body;
+  const { event, call } = req.body;
 
-         if (event !== 'call_ended') {
-                   return res.json({ ignored: true, event });
-         }
+  if (event !== 'call_ended') {
+    return res.json({ ignored: true, event });
+  }
 
-         const vars = (call && call.retell_llm_dynamic_variables) || {};
-          const leadId = vars.lead_id;
-          const leadName = vars.lead_name || 'Lead';
-          const leadEmail = vars.lead_email || '';
-          const transcript = (call && call.transcript) || '';
-          const recordingUrl = (call && call.recording_url) || '';
-          const transcriptUrl = (call && call.public_log_url) || '';
-          const disconnectReason = (call && call.disconnection_reason) || 'unknown';
+  const vars = (call && call.retell_llm_dynamic_variables) || {};
+  const leadId = vars.lead_id;
+  const leadName = vars.lead_name || 'Lead';
+  const leadEmail = vars.lead_email || '';
+  const transcript = (call && call.transcript) || '';
+  const recordingUrl = (call && call.recording_url) || '';
+  const transcriptUrl = (call && call.public_log_url) || '';
+  const disconnectReason = (call && call.disconnection_reason) || 'unknown';
 
-         if (!leadId) {
-                   console.warn('[retell-callback] No lead_id in dynamic variables');
-                   return res.status(400).json({ error: 'lead_id missing in call variables' });
-         }
+  if (!leadId) {
+    console.warn('[retell-callback] No lead_id in dynamic variables');
+    return res.status(400).json({ error: 'lead_id missing in call variables' });
+  }
 
-         // FIX: A call is 'Completed' (human answered) only when transcript has real content (>=50 chars)
-         // Without this check, voicemails ending with user_hangup were wrongly marked 'Contacted'
-         let callStatus = 'Completed';
-         if (disconnectReason === 'machine_detected') callStatus = 'Voicemail';
-         else if (disconnectReason === 'dial_no_answer') callStatus = 'No Answer';
-         else if (disconnectReason === 'dial_failed') callStatus = 'Failed';
-         else if (disconnectReason === 'voicemail_reached') callStatus = 'Voicemail';
-         else if (disconnectReason === 'no_answer') callStatus = 'No Answer';
-         else if (transcript.trim().length < 50) callStatus = 'No Answer';
+  // Determine call status from disconnect reason + transcript length
+  let callStatus = 'Completed';
+  if (disconnectReason === 'machine_detected') callStatus = 'Voicemail';
+  else if (disconnectReason === 'dial_no_answer') callStatus = 'No Answer';
+  else if (disconnectReason === 'dial_failed') callStatus = 'Failed';
+  else if (disconnectReason === 'voicemail_reached') callStatus = 'Voicemail';
+  else if (disconnectReason === 'no_answer') callStatus = 'No Answer';
+  else if (transcript.trim().length < 50) callStatus = 'No Answer';
 
-         const analysis = analyzeTranscript(transcript);
-          const outcome = analysis.outcome;
-          const meetingInterested = analysis.meetingInterested;
-          const bookingLinkSent = meetingInterested === 'Yes' ? 'Yes' : 'No';
+  const analysis = analyzeTranscript(transcript);
+  const outcome = analysis.outcome;
+  const meetingInterested = analysis.meetingInterested;
+  const bookingLinkSent = meetingInterested === 'Yes' ? 'Yes' : 'No';
+  const zohoLeadStatus = getZohoLeadStatus(callStatus);
 
-         // Determine Zoho Lead_Status based on call result
-         // Completed = answered = "Contacted"; anything else = "Attempted to Contact"
-         const zohoLeadStatus = getZohoLeadStatus(callStatus);
+  console.log('[retell-callback] leadId=' + leadId + ' status=' + callStatus + ' outcome=' + outcome + ' disconnectReason=' + disconnectReason);
 
-         console.log('[retell-callback] leadId=' + leadId + ' status=' + callStatus + ' outcome=' + outcome);
+  // Respond immediately so Retell does not retry the webhook
+  res.json({ success: true, leadId, callStatus, outcome, meetingInterested, bookingLinkSent });
 
-         let currentCallCount = 1;
-          let leadPhone = '';
-          let leadCompany = '';
-          try {
-                    const freshLead = await getZohoLead(leadId);
-                    currentCallCount = parseInt((freshLead && freshLead.AI_Call_Count) || '1', 10);
-                    leadPhone = (freshLead && freshLead.Phone) || '';
-                    leadCompany = (freshLead && freshLead.Company) || '';
-          } catch (e) {
-                    console.warn('[retell-callback] Could not fetch lead for call count:', e.message);
-          }
+  // --- Async CRM work (non-blocking) ---
+  (async () => {
+    let currentCallCount = 1;
+    let leadPhone = '';
+    let leadCompany = '';
+    try {
+      const freshLead = await getZohoLead(leadId);
+      currentCallCount = parseInt((freshLead && freshLead.AI_Call_Count) || '1', 10);
+      leadPhone = (freshLead && freshLead.Phone) || '';
+      leadCompany = (freshLead && freshLead.Company) || '';
+    } catch (e) {
+      console.warn('[retell-callback] Could not fetch lead for call count:', e.message);
+    }
 
-         // Build update fields, including Lead_Status
-         const updateFields = {
-                   AI_Last_Call_Status: callStatus,
-                   AI_Last_Call_Date: new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ''),
-                   Call_Outcome: outcome,
-                   Meeting_Interested: meetingInterested,
-                   Booking_Link_Sent: bookingLinkSent,
-                   Call_Summary: transcript.slice(0, 2000),
-                   Recording_URL: recordingUrl,
-                   Transcript_URL: transcriptUrl,
-                   AI_Call_Count: currentCallCount
-         };
-          if (zohoLeadStatus) updateFields.Lead_Status = zohoLeadStatus;
+    // Update all fields including Lead_Status (handled as picklist via safeUpdateZohoLead)
+    const updateFields = {
+      AI_Last_Call_Status: callStatus,
+      AI_Last_Call_Date: new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ''),
+      Call_Outcome: outcome,
+      Meeting_Interested: meetingInterested,
+      Booking_Link_Sent: bookingLinkSent,
+      Call_Summary: transcript.slice(0, 2000),
+      Recording_URL: recordingUrl,
+      Transcript_URL: transcriptUrl,
+      AI_Call_Count: currentCallCount,
+      Lead_Status: zohoLeadStatus
+    };
 
-         await safeUpdateZohoLead(leadId, updateFields);
-          console.log('[retell-callback] CRM update completed.');
+    try {
+      await safeUpdateZohoLead(leadId, updateFields);
+      console.log('[retell-callback] CRM update completed for lead ' + leadId);
+    } catch (err) {
+      console.error('[retell-callback] CRM update failed:', err.message);
+    }
 
-         try {
-                   const callDate = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
-                   await addZohoNote(leadId, leadName, callStatus, outcome, transcript, callDate);
-                   console.log('[retell-callback] Call summary note added to lead ' + leadId);
-         } catch (noteErr) {
-                   console.error('[retell-callback] Failed to add note:', noteErr.response ? JSON.stringify(noteErr.response.data) : noteErr.message);
-         }
+    // Add call summary note
+    try {
+      const callDate = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+      await addZohoNote(leadId, leadName, callStatus, outcome, transcript, callDate);
+      console.log('[retell-callback] Call summary note added to lead ' + leadId);
+    } catch (noteErr) {
+      console.error('[retell-callback] Failed to add note:', noteErr.response ? JSON.stringify(noteErr.response.data) : noteErr.message);
+    }
 
-         const needsFollowUp = FOLLOWUP_ELIGIBLE_STATUSES.includes(callStatus) || outcome === 'Callback Requested';
+    // Schedule follow-up if needed (based on callStatus only)
+    const needsFollowUp = FOLLOWUP_ELIGIBLE_STATUSES.includes(callStatus);
 
-         if (needsFollowUp && currentCallCount < MAX_CALLS_PER_LEAD) {
-                   const lead = {
-                             id: leadId,
-                             name: leadName,
-                             phone: leadPhone || '',
-                             email: leadEmail,
-                             company: leadCompany
-                   };
+    if (needsFollowUp && currentCallCount < MAX_CALLS_PER_LEAD) {
+      const lead = {
+        id: leadId,
+        name: leadName,
+        phone: leadPhone || '',
+        email: leadEmail,
+        company: leadCompany
+      };
 
-          if (lead.phone) {
-                    const followUpDelayMs = getDelayUntilNext330AMIST();
-                    console.log(`[retell-callback] Lead ${leadId} needs follow-up (status="${callStatus}", calls so far=${currentCallCount}/${MAX_CALLS_PER_LEAD}). Scheduling for next 3:30AM IST.`);
-                    await safeUpdateZohoLead(leadId, {
-                              AI_Last_Call_Status: 'Follow-Up Scheduled',
-                              AI_Follow_Up_Scheduled: new Date(Date.now() + followUpDelayMs).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
-                    });
-                    scheduleFollowUpCall(lead, followUpDelayMs);
-          } else {
-                    console.warn(`[retell-callback] Lead ${leadId} needs follow-up but phone not available. Skipping.`);
-          }
-         } else if (needsFollowUp && currentCallCount >= MAX_CALLS_PER_LEAD) {
-                   console.log(`[retell-callback] Lead ${leadId} max calls (${MAX_CALLS_PER_LEAD}) reached. Marking Max Calls Reached.`);
-                   await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: 'Max Calls Reached' });
-         }
+      if (lead.phone) {
+        const followUpDelayMs = getDelayUntilNext330AMIST();
+        console.log('[retell-callback] Lead ' + leadId + ' needs follow-up (status="' + callStatus + '", calls so far=' + currentCallCount + '/' + MAX_CALLS_PER_LEAD + '). Scheduling for next 3:30AM IST.');
+        try {
+          await safeUpdateZohoLead(leadId, {
+            AI_Last_Call_Status: 'Follow-Up Scheduled',
+            AI_Follow_Up_Scheduled: new Date(Date.now() + followUpDelayMs).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+          });
+        } catch (e) {
+          console.error('[retell-callback] Failed to mark Follow-Up Scheduled:', e.message);
+        }
+        scheduleFollowUpCall(lead, followUpDelayMs);
+      } else {
+        console.warn('[retell-callback] Lead ' + leadId + ' needs follow-up but phone not available. Skipping.');
+      }
+    } else if (needsFollowUp && currentCallCount >= MAX_CALLS_PER_LEAD) {
+      console.log('[retell-callback] Lead ' + leadId + ' max calls (' + MAX_CALLS_PER_LEAD + ') reached. Marking Max Calls Reached.');
+      try {
+        await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: 'Max Calls Reached', Lead_Status: 'Attempted to Contact' });
+      } catch (e) {
+        console.error('[retell-callback] Failed to mark Max Calls Reached:', e.message);
+      }
+    }
 
-         if (meetingInterested === 'Yes' && leadEmail) {
-                   try {
-                             await withRetry(function() { return sendBookingEmail(leadName, leadEmail); });
-                             console.log('[retell-callback] Onboarding email sent to ' + leadEmail);
-                   } catch (err) {
-                             console.error('[retell-callback] Email send failed:', err.message);
-                   }
-         }
-
-         return res.json({ success: true, leadId, callStatus, outcome, meetingInterested, bookingLinkSent, AI_Call_Count: currentCallCount });
+    // Send onboarding email if interested
+    if (meetingInterested === 'Yes' && leadEmail) {
+      try {
+        await withRetry(function() { return sendBookingEmail(leadName, leadEmail); });
+        console.log('[retell-callback] Onboarding email sent to ' + leadEmail);
+      } catch (err) {
+        console.error('[retell-callback] Email send failed:', err.message);
+      }
+    }
+  })();
 });
 
 // ONE-TIME MIGRATION: Set AI_Call_Count=1 for all leads that were called before
@@ -562,7 +578,7 @@ app.get('/health', (req, res) => {
 // --- Daily 3:30 AM IST Auto-Requeue ---
 // Skips leads with Lead_Status = "Contacted"
 async function runDailyRequeue() {
-          const TERMINAL = ['Interested', 'Not Interested', 'Completed', 'Max Calls Reached'];
+          const TERMINAL = ['Interested', 'Not Interested', 'Max Calls Reached'];
           const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
           let page = 1;
           const perPage = 200;
@@ -595,7 +611,7 @@ console.log('[daily-requeue] Starting daily 3:30AM IST requeue run...');
                               if (callCount >= MAX_CALLS_PER_LEAD) { skipped++; continue; }
                               if (TERMINAL.includes(status)) { skipped++; continue; }
                               if (!phone) { skipped++; continue; }
-                              if (callCount === 0) { skipped++; continue; }
+                              if (callCount === 0 && !status) { skipped++; continue; } // skip truly fresh leads (Zoho webhook handles those)
 
                               const leadObj = {
                                         id: lead.id,
