@@ -385,6 +385,12 @@ app.post('/webhook/zoho-lead', async (req, res) => {
          }
 });
 
+// --- Map callStatus to Zoho Lead_Status ---
+function getZohoLeadStatus(callStatus) {
+  if (callStatus === 'Completed') return 'Contacted';
+  return 'Attempted to Contact';
+}
+
 // ROUTE 2: Retell AI Post-Call Webhook -> Update CRM + Schedule follow-up + Send Email
 // Updates Lead_Status based on call outcome:
 //   - Call answered / completed -> "Contacted"
