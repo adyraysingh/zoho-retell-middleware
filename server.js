@@ -3,6 +3,7 @@ require('dotenv').config();
 
 const express = require('express');
 const axios   = require('axios');
+const crypto  = require('crypto');
 
 const app = express();
 app.use(express.json());
@@ -18,13 +19,15 @@ const {
   ZOHO_API_DOMAIN,
   WEBHOOK_SECRET,
   RESEND_API_KEY,
+  RETELL_WEBHOOK_SECRET,   // Retell HMAC secret (from Retell dashboard)
   PORT
 } = process.env;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const MAX_CALLS_PER_LEAD  = 3;
-const POST_CALL_GAP_MS    = 2 * 60 * 1000;   // 2-minute mandatory gap between calls
-const DAILY_REQUEUE_MAX   = 2000;             // Zoho hard cap per requeue run
+const MAX_CALLS_PER_LEAD   = 3;
+const POST_CALL_GAP_MS     = 2 * 60 * 1000;   // 2-minute mandatory gap
+const LOCK_SAFETY_TIMEOUT_MS = 10 * 60 * 1000; // 10-min deadlock guard
+const DAILY_REQUEUE_MAX    = 2000;
 
 // Statuses that warrant a follow-up call
 const FOLLOWUP_ELIGIBLE_STATUSES = new Set([
@@ -47,37 +50,24 @@ function isDoNotCallStatus(leadStatus) {
 }
 
 // ─── Sequential Call Queue ────────────────────────────────────────────────────
-//
-// DESIGN: Only one outbound call may be active at any time.
-//   • All callers (new lead webhook, follow-up scheduler, daily requeue) push
-//     an item onto callQueue and call processQueue().
-//   • processQueue() is a no-op if a call is already active.
-//   • When a call ends (retell-callback fires), callEnded() is called which
-//     waits POST_CALL_GAP_MS then processes the next item.
-//   • If the retell-callback never fires (e.g. network error), a safety timeout
-//     of 10 minutes auto-releases the lock so the queue never deadlocks.
-//
-const callQueue    = [];       // Array<{ lead, source, priority }>
-let isCallActive   = false;
+const callQueue   = [];   // Array<{ lead, source }>
+let isCallActive  = false;
 let lastCallEndedAt = 0;
-let activeCallId   = null;
-let activeLockTimer = null;    // Safety auto-release timer
-
-const LOCK_SAFETY_TIMEOUT_MS = 10 * 60 * 1000; // 10 min max lock
+let activeCallId  = null;
+let activeLockTimer = null;
 
 function enqueueCall(lead, source, priority = 'normal') {
-  // Deduplicate: don't queue the same lead twice
   const already = callQueue.some(item => item.lead.id === lead.id);
   if (already) {
-    console.log('[queue] Lead ' + lead.id + ' already in queue, skipping duplicate (' + source + ')');
+    console.log('[queue] Lead ' + lead.id + ' already in queue, skipping (' + source + ')');
     return;
   }
   if (priority === 'high') {
-    callQueue.unshift({ lead, source });  // new leads go to front
+    callQueue.unshift({ lead, source });
   } else {
-    callQueue.push({ lead, source });     // follow-ups go to back
+    callQueue.push({ lead, source });
   }
-  console.log('[queue] Enqueued lead ' + lead.id + ' (' + lead.name + ') source=' + source + ' priority=' + priority + ' queueLen=' + callQueue.length);
+  console.log('[queue] Enqueued lead ' + lead.id + ' (' + lead.name + ') src=' + source + ' pri=' + priority + ' qLen=' + callQueue.length);
   processQueue();
 }
 
@@ -87,7 +77,7 @@ async function processQueue() {
     return;
   }
   if (callQueue.length === 0) {
-    console.log('[queue] Queue empty, nothing to do');
+    console.log('[queue] Queue empty');
     return;
   }
 
@@ -95,92 +85,94 @@ async function processQueue() {
   const timeSinceLast = Date.now() - lastCallEndedAt;
   if (lastCallEndedAt > 0 && timeSinceLast < POST_CALL_GAP_MS) {
     const wait = POST_CALL_GAP_MS - timeSinceLast;
-    console.log('[queue] Post-call gap: waiting ' + Math.round(wait / 1000) + 's before next call');
+    console.log('[queue] Post-call gap: waiting ' + Math.round(wait / 1000) + 's');
     setTimeout(processQueue, wait);
     return;
   }
 
   const { lead, source } = callQueue.shift();
-  console.log('[queue] Processing lead ' + lead.id + ' (' + lead.name + ') source=' + source + ' remaining=' + callQueue.length);
+  console.log('[queue] Processing lead ' + lead.id + ' (' + lead.name + ') src=' + source + ' remaining=' + callQueue.length);
 
-  // Gate checks — re-verify freshly before dialling
+  // Re-verify freshness from Zoho before dialling
   try {
-    const fresh   = await getZohoLead(lead.id);
-    const lStatus = (fresh && fresh.Lead_Status || '').trim();
-    const aiStat  = (fresh && fresh.AI_Last_Call_Status || '').trim();
+    const fresh = await getZohoLead(lead.id);
+    const lStatus = (fresh && fresh.Lead_Status          || '').trim();
+    const aiStat  = (fresh && fresh.AI_Last_Call_Status  || '').trim();
     const count   = parseInt((fresh && fresh.AI_Call_Count) || '0', 10);
 
     if (isDoNotCallStatus(lStatus)) {
-      console.log('[queue] Skipping lead ' + lead.id + ' — Lead_Status="' + lStatus + '"');
+      console.log('[queue] Skipping ' + lead.id + ' — Lead_Status="' + lStatus + '"');
       return processQueue();
     }
     if (count >= MAX_CALLS_PER_LEAD) {
-      console.log('[queue] Skipping lead ' + lead.id + ' — max calls reached (' + count + ')');
+      console.log('[queue] Skipping ' + lead.id + ' — max calls (' + count + ')');
       await safeUpdateZohoLead(lead.id, { AI_Last_Call_Status: 'Max Calls Reached' });
       return processQueue();
     }
     if (TERMINAL_STATUSES.has(aiStat)) {
-      console.log('[queue] Skipping lead ' + lead.id + ' — terminal status "' + aiStat + '"');
+      console.log('[queue] Skipping ' + lead.id + ' — terminal status "' + aiStat + '"');
       return processQueue();
     }
-    // Update lead object with freshest data
+    // Refresh phone from latest Zoho data
     if (fresh && fresh.Phone) lead.phone = fresh.Phone;
+    // Store current count so we can increment it atomically
+    lead._callCount = count;
   } catch (e) {
-    console.warn('[queue] Could not re-verify lead ' + lead.id + ' (proceeding):', e.message);
+    console.warn('[queue] Re-verify failed for ' + lead.id + ' (proceeding):', e.message);
+    lead._callCount = lead._callCount || 0;
   }
 
-  // Acquire the lock
+  // Acquire lock
   isCallActive  = true;
   activeCallId  = null;
 
-  // Safety: auto-release lock after 10 min in case retell-callback never fires
+  // Safety: auto-release after 10 min if retell-callback never fires
   activeLockTimer = setTimeout(() => {
-    console.error('[queue] SAFETY: Lock held >10min for lead ' + lead.id + ', force-releasing');
-    callEnded();
+    console.error('[queue] SAFETY TIMEOUT: force-releasing lock for lead ' + lead.id);
+    callEnded(false);
   }, LOCK_SAFETY_TIMEOUT_MS);
 
   try {
     const callData = await withRetry(() => placeRetellCall(lead));
-    activeCallId   = callData.call_id;
-    console.log('[queue] Call placed for lead ' + lead.id + ' call_id=' + activeCallId + ' source=' + source);
+    activeCallId = callData.call_id;
+    console.log('[queue] Call placed — lead=' + lead.id + ' call_id=' + activeCallId);
 
-    // Fetch accurate call count and update CRM
-    let newCount = 1;
-    try {
-      const f  = await getZohoLead(lead.id);
-      newCount = parseInt((f && f.AI_Call_Count) || '0', 10) + 1;
-    } catch (_) {}
+    // Increment count atomically from the value we read
+    const newCount = (lead._callCount || 0) + 1;
 
     await safeUpdateZohoLead(lead.id, {
       AI_Last_Call_Status : 'Call Initiated',
       AI_Last_Call_Date   : nowString(),
-      AI_Call_Count       : newCount,
-      Lead_Status         : 'Attempted to Contact'
+      AI_Call_Count       : newCount
     });
   } catch (err) {
-    console.error('[queue] Failed to place call for lead ' + lead.id + ':', err.response ? err.response.data : err.message);
+    const msg = err.response ? JSON.stringify(err.response.data) : err.message;
+    console.error('[queue] Call placement failed for lead ' + lead.id + ':', msg);
     try { await safeUpdateZohoLead(lead.id, { AI_Last_Call_Status: 'Call Failed' }); } catch (_) {}
-    callEnded();  // release lock even on failure
+    callEnded(false);
   }
 }
 
-// Called by retell-callback (and safety timer) to release the lock
-function callEnded() {
+// Called when call ends (retell-callback or safety timer)
+// crmDone: true = CRM writes are finished, false = release lock but CRM may still run
+function callEnded(crmDone) {
   if (activeLockTimer) { clearTimeout(activeLockTimer); activeLockTimer = null; }
-  isCallActive    = false;
-  activeCallId    = null;
+  isCallActive  = false;
+  activeCallId  = null;
   lastCallEndedAt = Date.now();
-  console.log('[queue] Call ended. Queue length=' + callQueue.length + '. Next call in ' + POST_CALL_GAP_MS / 1000 + 's if queue non-empty.');
+  console.log('[queue] Lock released. crmDone=' + crmDone + ' qLen=' + callQueue.length + '. Next call in ' + POST_CALL_GAP_MS / 1000 + 's.');
   if (callQueue.length > 0) {
     setTimeout(processQueue, POST_CALL_GAP_MS);
   }
 }
-// ─── Utility: current UTC timestamp string ────────────────────────────────────
+
+// ─── Utility ─────────────────────────────────────────────────────────────────
 function nowString() {
+  // Returns UTC ISO string — store as-is; Zoho accepts ISO datetime
   return new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
 }
 
-// ─── Zoho OAuth Token Cache ───────────────────────────────────────────────────
+// ─── Zoho OAuth ───────────────────────────────────────────────────────────────
 let cachedToken = null;
 let tokenExpiry = 0;
 
@@ -188,17 +180,21 @@ async function getZohoAccessToken() {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken;
   const res = await axios.post(
     'https://accounts.zoho.in/oauth/v2/token', null,
-    { params: { refresh_token: ZOHO_REFRESH_TOKEN, client_id: ZOHO_CLIENT_ID,
-                client_secret: ZOHO_CLIENT_SECRET, grant_type: 'refresh_token' } }
+    { params: {
+        refresh_token : ZOHO_REFRESH_TOKEN,
+        client_id     : ZOHO_CLIENT_ID,
+        client_secret : ZOHO_CLIENT_SECRET,
+        grant_type    : 'refresh_token'
+    }}
   );
   if (!res.data.access_token)
     throw new Error('Zoho token refresh failed: ' + JSON.stringify(res.data));
-  cachedToken = res.data.access_token;
-  tokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
+  cachedToken  = res.data.access_token;
+  tokenExpiry  = Date.now() + (res.data.expires_in - 60) * 1000;
   return cachedToken;
 }
 
-// ─── Retry Utility ────────────────────────────────────────────────────────────
+// ─── Retry ────────────────────────────────────────────────────────────────────
 async function withRetry(fn, retries = 3, delayMs = 2000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try { return await fn(); } catch (err) {
@@ -233,13 +229,15 @@ async function updateZohoLead(leadId, fields) {
   if (result && result.status === 'error')
     throw new Error('Zoho field error: ' + JSON.stringify(result));
   if (result && result.details)
-    console.warn('[zoho-update] Field-level details:', JSON.stringify(result.details));
+    console.warn('[zoho] Field-level details:', JSON.stringify(result.details));
   return result;
 }
 
-// ─── Zoho CRM: Safe update (picklists written individually) ──────────────────
+// ─── Zoho CRM: Safe update — picklists written individually ──────────────────
+// NOTE: Lead_Status is intentionally NOT in this list.
+// The AI/Retell system never updates Lead_Status — that is managed by humans in Zoho.
 const PICKLIST_FIELDS = new Set([
-  'Lead_Status', 'AI_Last_Call_Status', 'Call_Outcome', 'Meeting_Interested', 'Booking_Link_Sent'
+  'AI_Last_Call_Status', 'Call_Outcome', 'Meeting_Interested', 'Booking_Link_Sent'
 ]);
 
 async function safeUpdateZohoLead(leadId, fields) {
@@ -253,32 +251,36 @@ async function safeUpdateZohoLead(leadId, fields) {
   if (Object.keys(freeFields).length > 0) {
     try {
       await updateZohoLead(leadId, freeFields);
-      console.log('[zoho-update] Free fields written:', Object.keys(freeFields).join(', '));
+      console.log('[zoho] Free fields written:', Object.keys(freeFields).join(', '));
     } catch (err) {
-      console.error('[zoho-update] Free fields FAILED:', err.response ? JSON.stringify(err.response.data) : err.message);
+      console.error('[zoho] Free fields FAILED:', err.response ? JSON.stringify(err.response.data) : err.message);
     }
   }
   for (const [k, v] of Object.entries(picklistFields)) {
     if (!v) continue;
     try {
       await updateZohoLead(leadId, { [k]: v });
-      console.log('[zoho-update] Picklist written: ' + k + '="' + v + '"');
+      console.log('[zoho] Picklist written: ' + k + '="' + v + '"');
     } catch (err) {
-      console.error('[zoho-update] Picklist FAILED: ' + k + '="' + v + '" =>', err.response ? JSON.stringify(err.response.data) : err.message);
+      console.error('[zoho] Picklist FAILED: ' + k + '="' + v + '" =>', err.response ? JSON.stringify(err.response.data) : err.message);
     }
   }
 }
 
-// ─── Zoho CRM: Add call-summary note ─────────────────────────────────────────
+// ─── Zoho CRM: Add note ───────────────────────────────────────────────────────
 async function addZohoNote(leadId, leadName, callStatus, outcome, transcript, callDate) {
   const token   = await getZohoAccessToken();
   const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
   const title   = 'AI Call Summary - ' + callDate;
-  const body    = 'Call Date: '    + callDate    + '\n' +
-                  'Lead Name: '    + leadName    + '\n' +
-                  'Call Status: '  + callStatus  + '\n' +
-                  'Outcome: '      + outcome     + '\n\n' +
-                  '--- Transcript ---\n' + (transcript || 'No transcript available');
+  const summary = transcript && transcript.length > 2000
+    ? transcript.slice(0, 2000) + '\n[transcript truncated]'
+    : (transcript || 'No transcript available');
+  const body =
+    'Call Date: '    + callDate    + '\n' +
+    'Lead Name: '    + leadName    + '\n' +
+    'Call Status: '  + callStatus  + '\n' +
+    'Outcome: '      + outcome     + '\n\n' +
+    '--- Transcript ---\n' + summary;
   await axios.post(
     baseUrl + '/crm/v3/Notes',
     { data: [{ Note_Title: title, Note_Content: body, Parent_Id: leadId, se_module: 'Leads' }] },
@@ -286,19 +288,20 @@ async function addZohoNote(leadId, leadName, callStatus, outcome, transcript, ca
   );
 }
 
-// ─── Retell: Place Outbound Call ──────────────────────────────────────────────
+// ─── Retell: Place Call ───────────────────────────────────────────────────────
 async function placeRetellCall(lead) {
   const res = await axios.post(
     'https://api.retellai.com/v2/create-phone-call',
     {
-      agent_id   : RETELL_AGENT_ID,
+      agent_id  : RETELL_AGENT_ID,
       from_number: RETELL_FROM_NUMBER,
-      to_number  : lead.phone,
+      to_number : lead.phone,
       retell_llm_dynamic_variables: {
-        lead_id     : lead.id,
-        lead_name   : lead.name,
-        lead_email  : lead.email   || '',
-        company     : lead.company || 'your company',
+        lead_id    : lead.id,
+        lead_name  : lead.name,
+        lead_email : lead.email  || '',
+        lead_phone : lead.phone  || '',
+        company    : lead.company || 'your company',
         booking_link: 'https://start.makeyourlabel.com/'
       }
     },
@@ -307,7 +310,7 @@ async function placeRetellCall(lead) {
   return res.data;
 }
 
-// ─── Email: Send Onboarding Link ──────────────────────────────────────────────
+// ─── Email ────────────────────────────────────────────────────────────────────
 async function sendBookingEmail(leadName, leadEmail) {
   if (!RESEND_API_KEY) throw new Error('RESEND_API_KEY not configured');
   const firstName = (leadName || '').split(' ')[0] || leadName;
@@ -321,61 +324,81 @@ async function sendBookingEmail(leadName, leadEmail) {
 }
 
 // ─── Transcript Analysis ──────────────────────────────────────────────────────
+// Uses phrase-level matching (not single-word) to avoid false positives like
+// "yes", "sure", "not sure" triggering Interested incorrectly.
 function analyzeTranscript(transcript, callStatus) {
   transcript = transcript || '';
   const lower = transcript.toLowerCase().trim();
   if (!lower || lower.length < 10) {
     return callStatus === 'Voicemail'
-      ? { outcome: 'Voicemail Left',   meetingInterested: 'No' }
-      : { outcome: 'No Answer',         meetingInterested: 'No' };
+      ? { outcome: 'Voicemail Left',  meetingInterested: 'No' }
+      : { outcome: 'No Answer',       meetingInterested: 'No' };
   }
-  const NEGATIVE = ['not interested','no thank',"don't want",'dont want','please remove','do not call','wrong number','stop calling'];
-  const CALLBACK  = ['call me tomorrow','call back tomorrow','call later','try again tomorrow','call me later','call again','busy right now'];
-  const POSITIVE  = ['yes','interested','sure','absolutely','of course','would like','want to','sounds good','great','perfect','tell me more','how does it work','book','consultation','sign up'];
-  if (NEGATIVE.some(s => lower.includes(s))) return { outcome: 'Not Interested',     meetingInterested: 'No'  };
-  if (CALLBACK.some(s  => lower.includes(s))) return { outcome: 'Callback Requested', meetingInterested: 'No'  };
-  if (POSITIVE.some(s  => lower.includes(s))) return { outcome: 'Interested',         meetingInterested: 'Yes' };
+
+  // Negative signals — checked first (higher priority)
+  const NEGATIVE = [
+    'not interested', 'no thank', "don't want", 'dont want',
+    'please remove', 'do not call', 'wrong number', 'stop calling',
+    'not looking', 'not right now', 'no, thank'
+  ];
+  // Callback signals
+  const CALLBACK = [
+    'call me tomorrow', 'call back tomorrow', 'call later', 'try again tomorrow',
+    'call me later', 'call again later', 'busy right now', 'call me back',
+    'ill call you back', "i'll call you back"
+  ];
+  // Positive signals — must be multi-word or context-clear phrases
+  const POSITIVE = [
+    'yes i am interested', "yes, i'm interested", 'i am interested', "i'm interested",
+    'i would like to', 'i want to', 'sounds good', 'sounds great',
+    'tell me more', 'how does it work', 'let me book', 'i will book',
+    'sign me up', 'book a consultation', 'want to sign up',
+    'absolutely interested', 'of course i want'
+  ];
+
+  if (NEGATIVE.some(s => lower.includes(s))) return { outcome: 'Not Interested',      meetingInterested: 'No' };
+  if (CALLBACK.some(s => lower.includes(s))) return { outcome: 'Callback Requested',  meetingInterested: 'No' };
+  if (POSITIVE.some(s => lower.includes(s))) return { outcome: 'Interested',           meetingInterested: 'Yes' };
   return { outcome: 'Callback Requested', meetingInterested: 'No' };
 }
 
-// ─── Map Retell disconnect reason -> callStatus ───────────────────────────────
+// ─── Map Retell disconnect reason → callStatus ────────────────────────────────
 function getCallStatus(disconnectReason, transcript) {
   const dr = (disconnectReason || '').toLowerCase();
   if (dr === 'machine_detected' || dr === 'voicemail_reached') return 'Voicemail';
   if (dr === 'dial_no_answer'   || dr === 'no_answer')         return 'No Answer';
   if (dr === 'dial_failed'      || dr === 'error')             return 'Failed';
-  if ((transcript || '').trim().length >= 50)                  return 'Completed';
+  // Only treat as Completed if there's a meaningful human conversation (>= 100 chars)
+  if ((transcript || '').trim().length >= 100) return 'Completed';
   return 'No Answer';
 }
 
-// ─── Map callStatus -> Zoho Lead_Status ──────────────────────────────────────
-function getZohoLeadStatus(callStatus) {
-  return callStatus === 'Completed' ? 'Contacted' : 'Attempted to Contact';
-}
-
-// ─── IST time helpers ─────────────────────────────────────────────────────────
+// ─── IST helpers ──────────────────────────────────────────────────────────────
 const IST_OFFSET_MS   = 5.5 * 3600 * 1000;
 const THREE_THIRTY_MS = 3.5 * 3600 * 1000;
 
 function getDelayUntilNext330AMIST() {
-  const nowUTC      = Date.now();
-  const nowIST      = new Date(nowUTC + IST_OFFSET_MS);
+  const nowUTC     = Date.now();
+  const nowIST     = new Date(nowUTC + IST_OFFSET_MS);
   const midnightIST = Date.UTC(nowIST.getUTCFullYear(), nowIST.getUTCMonth(), nowIST.getUTCDate()) - IST_OFFSET_MS;
-  let target        = midnightIST + THREE_THIRTY_MS;
+  let target = midnightIST + THREE_THIRTY_MS;
   if (nowUTC >= target) target += 24 * 3600 * 1000;
   const delay = target - nowUTC;
   console.log('[scheduler] Next 3:30 AM IST: ' + new Date(target).toISOString() + ' (in ' + Math.round(delay / 60000) + ' min)');
   return delay;
 }
 
-// ─── Schedule a follow-up: just enqueue at the right future time ──────────────
+// ─── Schedule a follow-up call ────────────────────────────────────────────────
+// NOTE: setTimeout is used here. On Railway restart the timer is lost.
+// The daily requeue at 3:30 AM IST acts as the persistent recovery for missed follow-ups.
 function scheduleFollowUpCall(lead, delayMs) {
-  console.log('[followup] Scheduling lead ' + lead.id + ' (' + lead.name + ') enqueue in ' + Math.round(delayMs / 60000) + ' min');
+  console.log('[followup] Will enqueue lead ' + lead.id + ' (' + lead.name + ') in ' + Math.round(delayMs / 60000) + ' min');
   setTimeout(() => {
-    console.log('[followup] Enqueuing lead ' + lead.id + ' for follow-up call');
+    console.log('[followup] Enqueuing lead ' + lead.id + ' for follow-up');
     enqueueCall(lead, 'follow-up', 'normal');
   }, delayMs);
 }
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROUTE 1: Zoho CRM Webhook → new lead → enqueue call
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -384,22 +407,26 @@ app.post('/webhook/zoho-lead', async (req, res) => {
 
   const { webhook_secret, id, First_Name, Last_Name, Phone, Email, Company } = req.body;
 
+  // Validate webhook secret from body (Zoho custom webhooks send it in body)
   if (!WEBHOOK_SECRET || webhook_secret !== WEBHOOK_SECRET) {
     console.error('[zoho-lead] Unauthorized');
     return res.status(403).json({ error: 'Unauthorized' });
   }
   if (!id)    return res.status(400).json({ error: 'Lead id required' });
-  if (!Phone) { console.warn('[zoho-lead] No phone for lead', id); return res.status(400).json({ error: 'Phone required' }); }
+  if (!Phone) {
+    console.warn('[zoho-lead] No phone for lead', id);
+    return res.status(400).json({ error: 'Phone required' });
+  }
 
-  // Gate checks before queuing
+  // Gate checks
   try {
     const existing = await getZohoLead(id);
-    const ls       = (existing && existing.Lead_Status        || '').trim();
+    const ls       = (existing && existing.Lead_Status         || '').trim();
     const aiStatus = (existing && existing.AI_Last_Call_Status || '').trim();
     const count    = parseInt((existing && existing.AI_Call_Count) || '0', 10);
 
-    if (isDoNotCallStatus(ls))       return res.json({ success: false, skipped: true, reason: 'Lead_Status is ' + ls + ' — do not call' });
-    if (count >= MAX_CALLS_PER_LEAD) return res.json({ success: false, skipped: true, reason: 'Max calls reached', AI_Call_Count: count });
+    if (isDoNotCallStatus(ls))          return res.json({ success: false, skipped: true, reason: 'Lead_Status=' + ls });
+    if (count >= MAX_CALLS_PER_LEAD)    return res.json({ success: false, skipped: true, reason: 'Max calls reached' });
     if (TERMINAL_STATUSES.has(aiStatus)) return res.json({ success: false, skipped: true, reason: 'Terminal AI status: ' + aiStatus });
   } catch (fetchErr) {
     console.warn('[zoho-lead] Could not fetch lead (proceeding):', fetchErr.message);
@@ -413,10 +440,8 @@ app.post('/webhook/zoho-lead', async (req, res) => {
     company: Company || ''
   };
 
-  // Enqueue with high priority so new leads go to the front
   enqueueCall(lead, 'new-lead', 'high');
 
-  // Respond immediately — queue will handle the rest
   return res.json({
     success : true,
     message : 'Lead queued for call',
@@ -426,22 +451,39 @@ app.post('/webhook/zoho-lead', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ROUTE 2: Retell post-call webhook → release queue lock + update CRM
-// Responds 200 immediately; CRM work is async.
+// ROUTE 2: Retell post-call webhook → release queue lock + update AI Call Tracking
+//
+// IMPORTANT: This route ONLY updates the "AI Call Tracking" section fields:
+//   AI_Last_Call_Status, AI_Last_Call_Date, AI_Call_Count, Meeting_Interested,
+//   Call_Outcome, Call_Summary, Booking_Link_Sent, Transcript_URL,
+//   Recording_URL, AI_Follow_Up_Scheduled
+//
+// Lead_Status is NEVER touched by this route.
 // ═══════════════════════════════════════════════════════════════════════════════
 app.post('/webhook/retell-callback', async (req, res) => {
+  // Retell HMAC verification (if secret configured)
+  if (RETELL_WEBHOOK_SECRET) {
+    const sig     = req.headers['x-retell-signature'] || '';
+    const payload = JSON.stringify(req.body);
+    const expected = crypto.createHmac('sha256', RETELL_WEBHOOK_SECRET).update(payload).digest('hex');
+    if (sig !== expected) {
+      console.error('[retell-callback] Invalid signature');
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+  }
+
   const { event, call } = req.body || {};
   console.log('[retell-callback] event=' + event);
-
   if (event !== 'call_ended') return res.json({ ignored: true, event });
 
-  const vars             = (call && call.retell_llm_dynamic_variables) || {};
-  const leadId           = vars.lead_id;
-  const leadName         = vars.lead_name  || 'Lead';
-  const leadEmail        = vars.lead_email || '';
-  const transcript       = (call && call.transcript)           || '';
-  const recordingUrl     = (call && call.recording_url)        || '';
-  const transcriptUrl    = (call && call.public_log_url)       || '';
+  const vars            = (call && call.retell_llm_dynamic_variables) || {};
+  const leadId          = vars.lead_id;
+  const leadName        = vars.lead_name  || 'Lead';
+  const leadEmail       = vars.lead_email || '';
+  const leadPhone       = vars.lead_phone || '';   // now included in dynamic vars
+  const transcript      = (call && call.transcript)      || '';
+  const recordingUrl    = (call && call.recording_url)   || '';
+  const transcriptUrl   = (call && call.public_log_url)  || '';
   const disconnectReason = (call && call.disconnection_reason) || 'unknown';
 
   if (!leadId) {
@@ -449,50 +491,51 @@ app.post('/webhook/retell-callback', async (req, res) => {
     return res.status(400).json({ error: 'lead_id missing' });
   }
 
-  const callStatus        = getCallStatus(disconnectReason, transcript);
-  const analysis          = analyzeTranscript(transcript, callStatus);
-  const outcome           = analysis.outcome;
+  const callStatus      = getCallStatus(disconnectReason, transcript);
+  const analysis        = analyzeTranscript(transcript, callStatus);
+  const outcome         = analysis.outcome;
   const meetingInterested = analysis.meetingInterested;
-  const bookingLinkSent   = meetingInterested === 'Yes' ? 'Yes' : 'No';
-  const zohoLeadStatus    = getZohoLeadStatus(callStatus);
+  const bookingLinkSent = meetingInterested === 'Yes' ? 'Yes' : 'No';
 
   console.log('[retell-callback] leadId=' + leadId + ' callStatus=' + callStatus + ' outcome=' + outcome + ' disconnect=' + disconnectReason);
 
-  // ── Release queue lock immediately so next call can be scheduled ──────────
-  callEnded();
+  // Release queue lock immediately — next call can start its 2-min gap timer
+  callEnded(false);
 
-  // ── Respond to Retell immediately ─────────────────────────────────────────
+  // Respond to Retell immediately
   res.json({ success: true, leadId, callStatus, outcome, meetingInterested, bookingLinkSent });
 
-  // ── Async CRM work (non-blocking) ─────────────────────────────────────────
+  // Async CRM work (non-blocking, does NOT block the queue)
   (async () => {
     let currentCallCount = 1;
-    let leadPhone = '', leadCompany = '';
+    let freshPhone = leadPhone;  // use phone from dynamic vars as primary source
+    let freshCompany = '';
     try {
-      const fresh      = await getZohoLead(leadId);
+      const fresh = await getZohoLead(leadId);
       currentCallCount = parseInt((fresh && fresh.AI_Call_Count) || '1', 10);
-      leadPhone        = (fresh && fresh.Phone)   || '';
-      leadCompany      = (fresh && fresh.Company) || '';
+      if (!freshPhone) freshPhone = (fresh && fresh.Phone) || '';
+      freshCompany = (fresh && fresh.Company) || '';
     } catch (e) {
       console.warn('[retell-callback] Could not fetch lead:', e.message);
     }
 
     const callDate = nowString();
 
-    // Update all CRM fields
+    // ── Update ONLY AI Call Tracking fields — Lead_Status is NOT updated ────
     await safeUpdateZohoLead(leadId, {
-      AI_Last_Call_Status  : callStatus,
-      AI_Last_Call_Date    : callDate,
-      Call_Outcome         : outcome,
-      Meeting_Interested   : meetingInterested,
-      Booking_Link_Sent    : bookingLinkSent,
-      Call_Summary         : transcript.slice(0, 2000),
-      Recording_URL        : recordingUrl,
-      Transcript_URL       : transcriptUrl,
-      AI_Call_Count        : currentCallCount,
-      Lead_Status          : zohoLeadStatus
+      AI_Last_Call_Status : callStatus,
+      AI_Last_Call_Date   : callDate,
+      Call_Outcome        : outcome,
+      Meeting_Interested  : meetingInterested,
+      Booking_Link_Sent   : bookingLinkSent,
+      Call_Summary        : transcript
+        ? (transcript.length > 2000 ? transcript.slice(0, 2000) + ' [truncated]' : transcript)
+        : '',
+      Recording_URL       : recordingUrl,
+      Transcript_URL      : transcriptUrl,
+      AI_Call_Count       : currentCallCount
     });
-    console.log('[retell-callback] CRM updated for lead ' + leadId);
+    console.log('[retell-callback] AI Call Tracking updated for lead ' + leadId);
 
     // Add call-summary note
     try {
@@ -502,31 +545,39 @@ app.post('/webhook/retell-callback', async (req, res) => {
       console.error('[retell-callback] Note failed:', e.response ? JSON.stringify(e.response.data) : e.message);
     }
 
-    // ── Schedule follow-up if needed ──────────────────────────────────────
+    // ── Schedule follow-up if needed ─────────────────────────────────────────
     const needsFollowUp = FOLLOWUP_ELIGIBLE_STATUSES.has(callStatus);
 
     if (needsFollowUp && currentCallCount < MAX_CALLS_PER_LEAD) {
-      const lead = { id: leadId, name: leadName, phone: leadPhone, email: leadEmail, company: leadCompany };
-      if (lead.phone) {
+      const followLead = {
+        id      : leadId,
+        name    : leadName,
+        phone   : freshPhone,
+        email   : leadEmail,
+        company : freshCompany
+      };
+      if (followLead.phone) {
         const delayMs    = getDelayUntilNext330AMIST();
         const fireAtStr  = new Date(Date.now() + delayMs).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
-        console.log('[retell-callback] Scheduling follow-up for lead ' + leadId + ' at ' + fireAtStr + ' IST');
+        console.log('[retell-callback] Follow-up for lead ' + leadId + ' at ' + fireAtStr + ' UTC');
         try {
           await safeUpdateZohoLead(leadId, {
             AI_Last_Call_Status   : 'Follow-Up Scheduled',
             AI_Follow_Up_Scheduled: fireAtStr
           });
-        } catch (e) { console.error('[retell-callback] Could not mark Follow-Up Scheduled:', e.message); }
-        scheduleFollowUpCall(lead, delayMs);
+        } catch (e) {
+          console.error('[retell-callback] Could not mark Follow-Up Scheduled:', e.message);
+        }
+        scheduleFollowUpCall(followLead, delayMs);
       } else {
-        console.warn('[retell-callback] No phone for lead ' + leadId + ', skipping follow-up');
+        console.warn('[retell-callback] No phone for lead ' + leadId + ' — follow-up skipped');
       }
     } else if (needsFollowUp && currentCallCount >= MAX_CALLS_PER_LEAD) {
       console.log('[retell-callback] Max calls reached for lead ' + leadId);
       try { await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: 'Max Calls Reached' }); } catch (_) {}
     }
 
-    // ── Send onboarding email if interested ──────────────────────────────
+    // ── Send onboarding email if interested ───────────────────────────────────
     if (meetingInterested === 'Yes' && leadEmail) {
       try {
         await withRetry(() => sendBookingEmail(leadName, leadEmail));
@@ -537,27 +588,28 @@ app.post('/webhook/retell-callback', async (req, res) => {
     }
   })();
 });
+
 // ═══════════════════════════════════════════════════════════════════════════════
-// ROUTE 3: Health check — also exposes queue status
+// ROUTE 3: Health check
 // ═══════════════════════════════════════════════════════════════════════════════
 app.get('/health', (_req, res) => {
   res.json({
-    status         : 'ok',
-    service        : 'zoho-retell-middleware',
-    timestamp      : new Date().toISOString(),
-    queue          : {
-      active        : isCallActive,
-      activeCallId  : activeCallId,
-      pending       : callQueue.length,
-      lastCallEnded : lastCallEndedAt ? new Date(lastCallEndedAt).toISOString() : null,
-      nextCallIn    : (isCallActive || callQueue.length === 0) ? null
-                        : Math.max(0, Math.round((POST_CALL_GAP_MS - (Date.now() - lastCallEndedAt)) / 1000)) + 's'
+    status    : 'ok',
+    service   : 'zoho-retell-middleware',
+    timestamp : new Date().toISOString(),
+    queue     : {
+      active      : isCallActive,
+      activeCallId: activeCallId,
+      pending     : callQueue.length,
+      lastCallEnded: lastCallEndedAt ? new Date(lastCallEndedAt).toISOString() : null,
+      nextCallIn  : (isCallActive || callQueue.length === 0) ? null
+        : Math.max(0, Math.round((POST_CALL_GAP_MS - (Date.now() - lastCallEndedAt)) / 1000)) + 's'
     }
   });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ROUTE 4: Admin — queue status + manual drain
+// ROUTE 4: Admin — queue management
 // ═══════════════════════════════════════════════════════════════════════════════
 app.get('/admin/queue', (req, res) => {
   if (req.query.secret !== WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' });
@@ -578,11 +630,10 @@ app.post('/admin/queue/clear', (req, res) => {
   res.json({ success: true, cleared });
 });
 
-// Force-release the lock (emergency use)
 app.post('/admin/queue/release-lock', (req, res) => {
   if (req.body.secret !== WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' });
   console.warn('[admin] Manual lock release requested');
-  callEnded();
+  callEnded(true);
   res.json({ success: true, message: 'Lock released' });
 });
 
@@ -600,8 +651,10 @@ app.post('/admin/run-requeue', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 app.post('/admin/backfill-call-count', async (req, res) => {
   if (req.body.secret !== WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' });
-  const CALLED_STATUSES = new Set(['No Answer','Voicemail','Callback Requested','Call Initiated',
-    'Follow-Up Scheduled','Completed','Failed','Busy','Call Failed']);
+  const CALLED_STATUSES = new Set([
+    'No Answer', 'Voicemail', 'Callback Requested', 'Call Initiated',
+    'Follow-Up Scheduled', 'Completed', 'Failed', 'Busy', 'Call Failed'
+  ]);
   const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
   let page = 1, updated = 0, skipped = 0, errors = 0, total = 0;
   res.json({ success: true, message: 'Backfill started — check logs' });
@@ -617,17 +670,20 @@ app.post('/admin/backfill-call-count', async (req, res) => {
       if (!leads.length) break;
       for (const lead of leads) {
         const status     = (lead.AI_Last_Call_Status || '').trim();
-        const leadStatus = (lead.Lead_Status || '').trim();
+        const leadStatus = (lead.Lead_Status         || '').trim();
         const count      = lead.AI_Call_Count;
-        if (isDoNotCallStatus(leadStatus))                                 { skipped++; continue; }
-        if (!status || !CALLED_STATUSES.has(status))                      { skipped++; continue; }
+        if (isDoNotCallStatus(leadStatus))                           { skipped++; continue; }
+        if (!status || !CALLED_STATUSES.has(status))                 { skipped++; continue; }
         if (count !== null && count !== undefined && parseInt(count) > 0) { skipped++; continue; }
         try {
           await updateZohoLead(lead.id, { AI_Call_Count: 1 });
-          console.log('[backfill] AI_Call_Count=1 for ' + (lead.First_Name||'') + ' ' + (lead.Last_Name||''));
+          console.log('[backfill] AI_Call_Count=1 for ' + (lead.First_Name || '') + ' ' + (lead.Last_Name || ''));
           updated++;
           await new Promise(r => setTimeout(r, 200));
-        } catch (e) { console.error('[backfill] Failed for ' + lead.id + ':', e.message); errors++; }
+        } catch (e) {
+          console.error('[backfill] Failed for ' + lead.id + ':', e.message);
+          errors++;
+        }
       }
       if (!(r.data && r.data.info && r.data.info.more_records)) break;
       page++;
@@ -638,6 +694,8 @@ app.post('/admin/backfill-call-count', async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Daily 3:30 AM IST Auto-Requeue
+// Enqueues leads that need follow-up. Does NOT mark CRM before enqueuing
+// (to avoid the "stuck in Follow-Up Scheduled" loop bug).
 // ═══════════════════════════════════════════════════════════════════════════════
 async function runDailyRequeue() {
   console.log('[daily-requeue] Starting run...');
@@ -648,22 +706,31 @@ async function runDailyRequeue() {
       const token = await getZohoAccessToken();
       const r = await axios.get(baseUrl + '/crm/v3/Leads', {
         headers: { Authorization: 'Zoho-oauthtoken ' + token },
-        params : { fields: 'id,First_Name,Last_Name,Phone,Email,Company,AI_Call_Count,AI_Last_Call_Status,Lead_Status', per_page: 200, page }
+        params : {
+          fields  : 'id,First_Name,Last_Name,Phone,Email,Company,AI_Call_Count,AI_Last_Call_Status,Lead_Status',
+          per_page: 200,
+          page
+        }
       });
       const leads = (r.data && r.data.data) || [];
       totalFetched += leads.length;
       if (!leads.length) break;
+
       for (const lead of leads) {
         const count   = parseInt(lead.AI_Call_Count || '0', 10);
         const status  = (lead.AI_Last_Call_Status || '').trim();
         const phone   = lead.Phone || '';
-        const lStatus = (lead.Lead_Status || '').trim();
-        if (isDoNotCallStatus(lStatus))                                   { skipped++; continue; }
-        if (count >= MAX_CALLS_PER_LEAD)                                  { skipped++; continue; }
-        if (TERMINAL_STATUSES.has(status))                                { skipped++; continue; }
-        if (!phone)                                                       { skipped++; continue; }
-        if (count === 0 && !status)                                       { skipped++; continue; }
-        if (!FOLLOWUP_ELIGIBLE_STATUSES.has(status) && status !== '')     { skipped++; continue; }
+        const lStatus = (lead.Lead_Status          || '').trim();
+
+        if (isDoNotCallStatus(lStatus))                          { skipped++; continue; }
+        if (count >= MAX_CALLS_PER_LEAD)                         { skipped++; continue; }
+        if (TERMINAL_STATUSES.has(status))                       { skipped++; continue; }
+        if (!phone)                                              { skipped++; continue; }
+        // Skip leads that have never been called and have no AI status
+        if (count === 0 && !status)                              { skipped++; continue; }
+        // Only requeue if status indicates follow-up is needed
+        if (!FOLLOWUP_ELIGIBLE_STATUSES.has(status) && status !== '') { skipped++; continue; }
+
         const leadObj = {
           id     : lead.id,
           name   : ((lead.First_Name || '') + ' ' + (lead.Last_Name || '')).trim() || 'Valued Lead',
@@ -671,13 +738,18 @@ async function runDailyRequeue() {
           email  : lead.Email   || '',
           company: lead.Company || ''
         };
+
+        // Enqueue first; only mark CRM if enqueue succeeds (not a duplicate)
+        const wasAlready = callQueue.some(item => item.lead.id === lead.id);
+        if (wasAlready) { skipped++; continue; }
+
         try {
-          // Mark scheduled in CRM, then enqueue (queue handles the actual dialling)
+          enqueueCall(leadObj, 'daily-requeue', 'normal');
+          // Mark CRM after successful enqueue
           await safeUpdateZohoLead(lead.id, {
             AI_Last_Call_Status   : 'Follow-Up Scheduled',
             AI_Follow_Up_Scheduled: nowString()
           });
-          enqueueCall(leadObj, 'daily-requeue', 'normal');
           console.log('[daily-requeue] Enqueued lead ' + lead.id + ' (' + leadObj.name + ') count=' + count);
           queued++;
         } catch (err) {
@@ -685,8 +757,12 @@ async function runDailyRequeue() {
           errors++;
         }
       }
+
       if (!(r.data && r.data.info && r.data.info.more_records)) break;
-      if (totalFetched >= DAILY_REQUEUE_MAX) { console.log('[daily-requeue] Hit ' + DAILY_REQUEUE_MAX + ' record limit'); break; }
+      if (totalFetched >= DAILY_REQUEUE_MAX) {
+        console.log('[daily-requeue] Hit ' + DAILY_REQUEUE_MAX + ' record limit');
+        break;
+      }
       page++;
     }
   } catch (err) {
@@ -697,7 +773,7 @@ async function runDailyRequeue() {
 
 function scheduleDailyRequeue() {
   const delayMs = getDelayUntilNext330AMIST();
-  console.log('[daily-requeue] Next run scheduled in ' + Math.round(delayMs / 60000) + ' min');
+  console.log('[daily-requeue] Next run in ' + Math.round(delayMs / 60000) + ' min');
   setTimeout(async () => {
     await runDailyRequeue();
     scheduleDailyRequeue();
@@ -710,10 +786,10 @@ function scheduleDailyRequeue() {
 const port = PORT || 3000;
 app.listen(port, () => {
   console.log('[server] zoho-retell-middleware on port ' + port);
-  console.log('[server] Zoho webhook   : POST /webhook/zoho-lead');
+  console.log('[server] Zoho webhook  : POST /webhook/zoho-lead');
   console.log('[server] Retell callback: POST /webhook/retell-callback');
-  console.log('[server] Health         : GET  /health');
-  console.log('[server] Queue status   : GET  /admin/queue?secret=...');
+  console.log('[server] Health        : GET  /health');
+  console.log('[server] Queue status  : GET  /admin/queue?secret=...');
   scheduleDailyRequeue();
 });
 
@@ -725,9 +801,13 @@ app.get('/oauth/callback', async (req, res) => {
   if (!code) return res.status(400).send('No code provided');
   try {
     const r = await axios.post('https://accounts.zoho.in/oauth/v2/token', null, {
-      params: { code, client_id: ZOHO_CLIENT_ID, client_secret: ZOHO_CLIENT_SECRET,
-                redirect_uri: 'https://zoho-retell-middleware-production.up.railway.app/oauth/callback',
-                grant_type: 'authorization_code' }
+      params: {
+        code,
+        client_id    : ZOHO_CLIENT_ID,
+        client_secret: ZOHO_CLIENT_SECRET,
+        redirect_uri : 'https://zoho-retell-middleware-production.up.railway.app/oauth/callback',
+        grant_type   : 'authorization_code'
+      }
     });
     console.log('[oauth-callback] Token response:', JSON.stringify(r.data));
     const rt = r.data.refresh_token;
