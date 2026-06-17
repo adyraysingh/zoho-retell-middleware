@@ -461,15 +461,17 @@ app.post('/webhook/zoho-lead', async (req, res) => {
 // Lead_Status is NEVER touched by this route.
 // ═══════════════════════════════════════════════════════════════════════════════
 app.post('/webhook/retell-callback', async (req, res) => {
-  // Retell HMAC verification (if secret configured)
-  if (RETELL_WEBHOOK_SECRET) {
-    const sig     = req.headers['x-retell-signature'] || '';
-    const payload = JSON.stringify(req.body);
-    const expected = crypto.createHmac('sha256', RETELL_WEBHOOK_SECRET).update(payload).digest('hex');
-    if (sig !== expected) {
-      console.error('[retell-callback] Invalid signature');
-      return res.status(401).json({ error: 'Invalid signature' });
-    }
+  // Retell HMAC verification — mandatory, always enforced
+  if (!RETELL_WEBHOOK_SECRET) {
+    console.error('[retell-callback] RETELL_WEBHOOK_SECRET env var not set — rejecting request');
+    return res.status(500).json({ error: 'Server misconfigured: RETELL_WEBHOOK_SECRET missing' });
+  }
+  const sig      = req.headers['x-retell-signature'] || '';
+  const payload  = JSON.stringify(req.body);
+  const expected = crypto.createHmac('sha256', RETELL_WEBHOOK_SECRET).update(payload).digest('hex');
+  if (sig !== expected) {
+    console.error('[retell-callback] Invalid signature — request rejected');
+    return res.status(401).json({ error: 'Invalid signature' });
   }
 
   const { event, call } = req.body || {};
