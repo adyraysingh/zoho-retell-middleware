@@ -872,4 +872,59 @@ app.get('/oauth/callback', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ROUTE 7: Retell Inbound Webhook — look up caller by phone in Zoho → inject lead_name
+// Retell sends: { from_number: "+1xxxxxxxxxx", to_number: "...", ... }
+// We respond:   { dynamic_variables: { lead_name, lead_email, lead_phone, lead_id, company } }
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/webhook/inbound', async (req, res) => {
+  const fromNumber = (req.body && req.body.from_number) || '';
+  console.log('[inbound] Incoming call from:', fromNumber);
+
+  // Default variables — used when caller is not found in Zoho
+  let dynamicVars = {
+    lead_name   : 'there',
+    lead_email  : '',
+    lead_phone  : fromNumber,
+    lead_id     : '',
+    company     : ''
+  };
+
+  if (fromNumber) {
+    try {
+      const token = await getZohoAccessToken();
+      const baseUrl = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
+
+      // Search Zoho Leads by phone number
+      const searchRes = await axios.get(baseUrl + '/crm/v3/Leads/search', {
+        headers: { Authorization: 'Zoho-oauthtoken ' + token },
+        params  : { phone: fromNumber, fields: 'id,First_Name,Last_Name,Email,Phone,Company' }
+      });
+
+      const leads = (searchRes.data && searchRes.data.data) || [];
+      if (leads.length > 0) {
+        const lead = leads[0];
+        const firstName = (lead.First_Name || '').trim();
+        const lastName  = (lead.Last_Name  || '').trim();
+        const fullName  = (firstName + ' ' + lastName).trim() || 'there';
+        dynamicVars = {
+          lead_name : fullName,
+          lead_email: lead.Email   || '',
+          lead_phone: lead.Phone   || fromNumber,
+          lead_id   : lead.id      || '',
+          company   : lead.Company || ''
+        };
+        console.log('[inbound] Found lead:', lead.id, fullName);
+      } else {
+        console.log('[inbound] No Zoho lead found for', fromNumber, '— using defaults');
+      }
+    } catch (err) {
+      console.error('[inbound] Zoho lookup failed:', err.response ? JSON.stringify(err.response.data) : err.message);
+    }
+  }
+
+  // Retell expects: { "dynamic_variables": { ... } }
+  res.json({ dynamic_variables: dynamicVars });
+});
+
 module.exports = app;
