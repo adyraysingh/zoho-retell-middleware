@@ -35,7 +35,17 @@ const FOLLOWUP_ELIGIBLE_STATUSES = new Set([
 // Statuses where no further outreach should happen
 const TERMINAL_STATUSES = new Set([
   'Interested', 'Not Interested', 'Max Calls Reached'
+
+
+// Lead_Status values that mean "client onboarded or hard-stop — never call again"
+const DO_NOT_CALL_LEAD_STATUSES = new Set([
+  'Contacted', 'Onboarded'
 ]);
+
+// Helper: should we skip calling this lead based on Lead_Status?
+function isDoNotCallStatus(leadStatus) {
+  return DO_NOT_CALL_LEAD_STATUSES.has((leadStatus || '').trim());
+}]);
 
 // ─── Zoho OAuth Token Cache ───────────────────────────────────────────────────
 let cachedToken  = null;
@@ -263,7 +273,7 @@ function scheduleFollowUpCall(lead, delayMs) {
       const status  = (fresh.AI_Last_Call_Status || '').trim();
       const lStatus = (fresh.Lead_Status || '').trim();
 
-      if (lStatus === 'Contacted')                      { console.log('[followup] Lead ' + lead.id + ' already Contacted, skipping'); return; }
+      if (isDoNotCallStatus(lStatus))                      { console.log('[followup] Lead ' + lead.id + ' Lead_Status="' + lStatus + '" — do-not-call, skipping'); return; }
       if (count >= MAX_CALLS_PER_LEAD)                  { await safeUpdateZohoLead(lead.id, { AI_Last_Call_Status: 'Max Calls Reached' }); return; }
       if (!FOLLOWUP_ELIGIBLE_STATUSES.has(status))      { console.log('[followup] Lead ' + lead.id + ' status "' + status + '" not eligible, skipping'); return; }
 
@@ -306,7 +316,7 @@ app.post('/webhook/zoho-lead', async (req, res) => {
     const aiStatus = (existing && existing.AI_Last_Call_Status || '').trim();
     const count    = parseInt((existing && existing.AI_Call_Count) || '0', 10);
 
-    if (ls === 'Contacted')                     { return res.json({ success: false, skipped: true, reason: 'Already Contacted' }); }
+    if (isDoNotCallStatus(ls))                     { return res.json({ success: false, skipped: true, reason: 'Lead_Status is ' + ls + ' — do not call' }); }
     if (count >= MAX_CALLS_PER_LEAD)            { return res.json({ success: false, skipped: true, reason: 'Max calls reached', AI_Call_Count: count }); }
     if (TERMINAL_STATUSES.has(aiStatus))        { return res.json({ success: false, skipped: true, reason: 'Terminal AI status: ' + aiStatus }); }
   } catch (fetchErr) {
@@ -500,7 +510,7 @@ app.post('/admin/backfill-call-count', async (req, res) => {
         const status     = (lead.AI_Last_Call_Status || '').trim();
         const leadStatus = (lead.Lead_Status || '').trim();
         const count      = lead.AI_Call_Count;
-        if (leadStatus === 'Contacted')                                         { skipped++; continue; }
+        if (isDoNotCallStatus(leadStatus))                                         { skipped++; continue; }
         if (!status || !CALLED_STATUSES.has(status))                           { skipped++; continue; }
         if (count !== null && count !== undefined && parseInt(count) > 0)      { skipped++; continue; }
         try {
@@ -548,7 +558,7 @@ async function runDailyRequeue() {
         const lStatus  = (lead.Lead_Status || '').trim();
 
         // Skip gates
-        if (lStatus === 'Contacted')           { skipped++; continue; }
+        if (isDoNotCallStatus(lStatus))           { skipped++; continue; }
         if (count >= MAX_CALLS_PER_LEAD)        { skipped++; continue; }
         if (TERMINAL_STATUSES.has(status))      { skipped++; continue; }
         if (!phone)                             { skipped++; continue; }
