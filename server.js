@@ -81,7 +81,8 @@ async function sendEmail({ to, toName, subject, text, html, inReplyTo, reference
   return res.data;
 }
 
-\n// ─── OpenAI: Generate Maya reply ─────────────────────────────────────────────
+
+// ─── OpenAI: Generate Maya reply ─────────────────────────────────────────────
 async function generateMayaReply(leadName, customerMessage, emailHistory) {
   if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY not configured');
   const firstName = (leadName || '').split(' ')[0] || 'there';
