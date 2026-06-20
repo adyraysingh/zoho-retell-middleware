@@ -46,7 +46,7 @@ const TERMINAL_STATUSES = new Set([
   'Interested', 'Not Interested', 'Max Calls Reached'
 ]);
 const DO_NOT_CALL_LEAD_STATUSES = new Set([
-  'Contacted', 'Onboarded'
+  'Contacted', 'Onboarded', 'Attempted to Contact'
 ]);
 
 function isDoNotCallStatus(leadStatus) {
