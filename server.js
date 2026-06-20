@@ -23,7 +23,10 @@ const {
   WEBHOOK_SECRET,
   OPENAI_API_KEY,
   MAYA_EMAIL,          // maya@makeyourlabel.com
-  MAYA_APP_PASSWORD,   // Google Workspace App Password for maya@
+  MAYA_APP_PASSWORD,
+GMAIL_CLIENT_ID,
+GMAIL_CLIENT_SECRET,
+GMAIL_REFRESH_TOKEN,   // Google Workspace App Password for maya@
   PORT
 } = process.env;
 
@@ -49,62 +52,36 @@ const DO_NOT_CALL_LEAD_STATUSES = new Set([
 function isDoNotCallStatus(leadStatus) {
   return DO_NOT_CALL_LEAD_STATUSES.has((leadStatus || '').trim());
 }
-// ─── Nodemailer SMTP Transport (port 465 SSL — Railway allows this) ──────────
-function createSmtpTransport() {
-  return nodemailer.createTransport({
-    host             : 'smtp.gmail.com',
-    port             : 587,
-    secure           : false,
-    requireTLS       : true,
-    connectionTimeout: 30000,
-    greetingTimeout  : 15000,
-    socketTimeout    : 60000,
-    auth: { user: MAYA_EMAIL, pass: MAYA_APP_PASSWORD },
-    tls : { rejectUnauthorized: false }
-  });
+// ─── Gmail API Email Sending (replaces SMTP - Railway blocks SMTP ports) ────────────────────
+const { google } = require('googleapis');
+
+function getGmailClient() {
+  const { GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN } = process.env;
+  const oauth2Client = new google.auth.OAuth2(GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, 'https://zoho-retell-middleware-production.up.railway.app/gmail/callback');
+  oauth2Client.setCredentials({ refresh_token: GMAIL_REFRESH_TOKEN });
+  return google.gmail({ version: 'v1', auth: oauth2Client });
 }
 
-// ─── Send email via Gmail SMTP ────────────────────────────────────────────────
+function makeRawEmail({ from, to, toName, subject, text, html, inReplyTo, references }) {
+  const boundary = 'MYL_' + Date.now();
+  const toFull = toName ? '"' + toName + '" <' + to + '>' : to;
+  let headers = 'From: ' + from + '\r\nTo: ' + toFull + '\r\nSubject: ' + subject + '\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary="' + boundary + '"';
+  if (inReplyTo) headers += '\r\nIn-Reply-To: ' + inReplyTo;
+  if (references) headers += '\r\nReferences: ' + references;
+  const raw = headers + '\r\n\r\n--' + boundary + '\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n' + (text||'') + '\r\n\r\n--' + boundary + '\r\nContent-Type: text/html; charset=utf-8\r\n\r\n' + (html||text||'') + '\r\n\r\n--' + boundary + '--';
+  return Buffer.from(raw).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// ─── Send email via Gmail API (HTTPS, Railway-safe) ──────────────────────────────────────
 async function sendEmail({ to, toName, subject, text, html, inReplyTo, references }) {
-  const transporter = createSmtpTransport();
-  const mailOptions = {
-    from   : MAYA_FROM,
-    to     : toName ? '"' + toName + '" <' + to + '>' : to,
-    subject,
-    text,
-    html
-  };
-  if (inReplyTo)  mailOptions.inReplyTo  = inReplyTo;
-  if (references) mailOptions.references = references;
-
-  const info = await transporter.sendMail(mailOptions);
-  console.log('[smtp] Sent to ' + to + ' messageId=' + info.messageId);
-  return info;
+  const gmail = getGmailClient();
+  const raw = makeRawEmail({ from: MAYA_FROM, to, toName, subject, text, html, inReplyTo, references });
+  const res = await gmail.users.messages.send({ userId: 'me', requestBody: { raw } });
+  console.log('[gmail] Sent to ' + to + ' messageId=' + res.data.id);
+  return res.data;
 }
 
-// ─── Send initial booking email ───────────────────────────────────────────────
-async function sendBookingEmail(leadName, leadEmail) {
-  const firstName = (leadName || '').split(' ')[0] || leadName;
-  await sendEmail({
-    to     : leadEmail,
-    toName : leadName,
-    subject: 'Get Started with MakeYourLabel',
-    text   : 'Hi ' + firstName + ',\n\nThank you for your interest in MakeYourLabel!\n\nPlease complete your onboarding here:\nhttps://start.makeyourlabel.com/\n\nIf you have any questions, just reply to this email — I read every one.\n\nRegards,\nMAYA | MakeYourLabel',
-    html   : '<div style="font-family:Arial,sans-serif;font-size:15px;color:#222;line-height:1.7;max-width:600px;"><p>Hi ' + firstName + ',</p><p>Thank you for your interest in MakeYourLabel!</p><p><a href="https://start.makeyourlabel.com/" style="background:#000;color:#fff;padding:12px 28px;text-decoration:none;border-radius:4px;display:inline-block;font-weight:bold;">Start Onboarding</a></p><p>If you have any questions, just reply to this email — I read every one.</p><br><p>Regards,<br><strong>MAYA</strong><br>MakeYourLabel</p></div>'
-  });
-}
-
-// ─── Send Maya AI reply email ─────────────────────────────────────────────────
-async function sendMayaReply({ to, toName, subject, replyText, replyHtml, inReplyTo, references }) {
-  const replySubject = subject && subject.startsWith('Re:') ? subject : 'Re: ' + (subject || 'Your enquiry');
-  await sendEmail({
-    to, toName, inReplyTo, references,
-    subject: replySubject,
-    text   : replyText,
-    html   : replyHtml
-  });
-}
-// ─── OpenAI: Generate Maya reply ─────────────────────────────────────────────
+\n// ─── OpenAI: Generate Maya reply ─────────────────────────────────────────────
 async function generateMayaReply(leadName, customerMessage, emailHistory) {
   if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY not configured');
   const firstName = (leadName || '').split(' ')[0] || 'there';
@@ -579,6 +556,27 @@ app.post('/webhook/inbound', async (req, res) => {
     } catch(_) {}
   }
   res.json({ dynamic_variables: dv });
+});
+
+// ROUTE 6b: Gmail OAuth auth URL generator
+app.get('/gmail/auth', (req, res) => {
+  const { GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET } = process.env;
+  const oauth2Client = new (require('googleapis').google.auth.OAuth2)(GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, 'https://zoho-retell-middleware-production.up.railway.app/gmail/callback');
+  const authUrl = oauth2Client.generateAuthUrl({ access_type: 'offline', scope: ['https://www.googleapis.com/auth/gmail.send'], prompt: 'consent' });
+  res.redirect(authUrl);
+});
+
+// ROUTE 6c: Gmail OAuth callback - exchanges code for refresh token
+app.get('/gmail/callback', async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send('No code');
+  try {
+    const { GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET } = process.env;
+    const oauth2Client = new (require('googleapis').google.auth.OAuth2)(GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, 'https://zoho-retell-middleware-production.up.railway.app/gmail/callback');
+    const { tokens } = await oauth2Client.getToken(code);
+    const rt = tokens.refresh_token;
+    return rt ? res.send('<h2 style="font-family:monospace;padding:20px">SUCCESS - Gmail Refresh Token:</h2><pre style="background:#f0f0f0;padding:15px;font-size:14px;word-break:break-all">' + rt + '</pre><p style="font-family:monospace;padding:20px;color:red">Set GMAIL_REFRESH_TOKEN in Railway Variables to the value above, then redeploy.</p>') : res.send('<pre>' + JSON.stringify(tokens) + '</pre>');
+  } catch(e) { return res.status(500).send(e.message); }
 });
 
 // ROUTE 6: OAuth callback
