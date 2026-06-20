@@ -51,13 +51,15 @@ function isDoNotCallStatus(leadStatus) {
 // ─── Nodemailer SMTP Transport (port 465 SSL — Railway allows this) ──────────
 function createSmtpTransport() {
   return nodemailer.createTransport({
-    host  : 'smtp.gmail.com',
-    port  : 465,
-    secure: true,          // SSL on 465, NOT STARTTLS on 587
-    auth  : {
-      user: MAYA_EMAIL,
-      pass: MAYA_APP_PASSWORD
-    }
+    host             : 'smtp.gmail.com',
+    port             : 587,
+    secure           : false,
+    requireTLS       : true,
+    connectionTimeout: 30000,
+    greetingTimeout  : 15000,
+    socketTimeout    : 60000,
+    auth: { user: MAYA_EMAIL, pass: MAYA_APP_PASSWORD },
+    tls : { rejectUnauthorized: false }
   });
 }
 
