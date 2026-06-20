@@ -435,12 +435,13 @@ function analyzeTranscript(transcript, callStatus) {
 }
 
 function getCallStatus(disconnectReason, transcript) {
-  const dr = (disconnectReason||'').toLowerCase();
-  if (dr === 'machine_detected' || dr === 'voicemail_reached') return 'Voicemail';
-  if (dr === 'dial_no_answer'   || dr === 'no_answer')         return 'No Answer';
-  if (dr === 'dial_failed'      || dr === 'error')             return 'Failed';
-  if ((transcript||'').trim().length >= 100)                    return 'Completed';
-  return 'No Answer';
+const dr = (disconnectReason||'').toLowerCase();
+if (dr === 'user_declined' || dr === 'call_rejected' || dr === 'busy') return 'No Answer';
+if (dr === 'machine_detected' || dr === 'voicemail_reached') return 'Voicemail';
+if (dr === 'dial_no_answer' || dr === 'no_answer') return 'No Answer';
+if (dr === 'dial_failed' || dr === 'error') return 'Failed';
+if ((transcript||'').trim().length >= 100) return 'Completed';
+return 'No Answer';
 }
 
 const IST_OFFSET_MS = 5.5 * 3600 * 1000;
@@ -511,23 +512,25 @@ app.post('/webhook/retell-callback', async (req, res) => {
   callEnded(false);
   res.json({ success: true, leadId, callStatus, outcome });
   (async () => {
-    let count = 1, freshPhone = vars.lead_phone||'', freshCompany = '';
-    try { const f = await getZohoLead(leadId); count = parseInt((f&&f.AI_Call_Count)||'1',10); if (!freshPhone) freshPhone=(f&&f.Phone)||''; freshCompany=(f&&f.Company)||''; } catch(_) {}
-    const callDate = nowISTString();
-    await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: callStatus, AI_Last_Call_Date: callDate, Call_Outcome: outcome, Meeting_Interested: meetingInterested, Booking_Link_Sent: bookingLinkSent, Call_Summary: transcript.slice(0,2000), Recording_URL: (call&&call.recording_url)||'', Transcript_URL: (call&&call.public_log_url)||'', AI_Call_Count: count });
-    try { await addZohoNote(leadId, vars.lead_name||'Lead', callStatus, outcome, transcript, callDate); } catch(_) {}
-    if (FOLLOWUP_ELIGIBLE_STATUSES.has(callStatus) && count < MAX_CALLS_PER_LEAD && freshPhone) {
-      const delay = getDelayUntilNext330AMIST();
-      const fireAt = new Date(Date.now()+delay+IST_OFFSET_MS).toISOString().replace('T',' ').replace(/\.\d+Z$/,'')+' IST';
-      try { await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: 'Follow-Up Scheduled', AI_Follow_Up_Scheduled: fireAt }); } catch(_) {}
-      scheduleFollowUpCall({ id: leadId, name: vars.lead_name||'Lead', phone: freshPhone, email: vars.lead_email||'', company: freshCompany }, delay);
-    } else if (FOLLOWUP_ELIGIBLE_STATUSES.has(callStatus) && count >= MAX_CALLS_PER_LEAD) {
-      try { await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: 'Max Calls Reached' }); } catch(_) {}
-    }
-    if (meetingInterested === 'Yes' && vars.lead_email) {
-      try { await withRetry(() => sendBookingEmail(vars.lead_name||'', vars.lead_email)); console.log('[callback] Booking email sent to ' + vars.lead_email); } catch(e) { console.error('[callback] Email failed:', e.message); }
-    }
-  })();
+  let count = 1, freshPhone = vars.lead_phone||'', freshCompany = vars.lead_email||'';
+  try { const f = await getZohoLead(leadId); count = parseInt((f&&f.AI_Call_Count)||'1',10); if (!freshPhone) freshPhone=(f&&f.Phone)||''; freshCompany=(f&&f.Company)||''; } catch(_) {}
+  const callDate = nowISTString();
+  // Save call count separately to ensure it always updates
+  try { await updateZohoLead(leadId, { AI_Call_Count: count }); } catch(_) {}
+  await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: callStatus, AI_Last_Call_Date: callDate, Call_Outcome: outcome, Meeting_Interested: meetingInterested, Booking_Link_Sent: bookingLinkSent, Call_Summary: transcript.slice(0,2000), Recording_URL: (call&&call.recording_url)||'', Transcript_URL: (call&&call.public_log_url)||'' });
+  try { await addZohoNote(leadId, vars.lead_name||'Lead', callStatus, outcome, transcript, callDate); } catch(_) {}
+  if (FOLLOWUP_ELIGIBLE_STATUSES.has(callStatus) && count < MAX_CALLS_PER_LEAD && freshPhone) {
+    const delay = getDelayUntilNext330AMIST();
+    const fireAt = new Date(Date.now()+delay+IST_OFFSET_MS).toISOString().replace('T',' ').replace(/\.\d+Z$/,'')+' IST';
+    try { await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: 'Follow-Up Scheduled', AI_Follow_Up_Scheduled: fireAt }); } catch(_) {}
+    scheduleFollowUpCall({ id: leadId, name: vars.lead_name||'Lead', phone: freshPhone, email: vars.lead_email||'', company: freshCompany }, delay);
+  } else if (FOLLOWUP_ELIGIBLE_STATUSES.has(callStatus) && count >= MAX_CALLS_PER_LEAD) {
+    try { await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: 'Max Calls Reached' }); } catch(_) {}
+  }
+  if (meetingInterested === 'Yes' && vars.lead_email) {
+    try { await withRetry(() => sendBookingEmail(vars.lead_name||'', vars.lead_email)); console.log('[callback] Booking email sent to ' + vars.lead_email); } catch(e) { console.error('[callback] Email failed:', e.message); }
+  }
+})()
 });
 
 // ROUTE 3: Health
