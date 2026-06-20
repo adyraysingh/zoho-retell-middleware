@@ -7,6 +7,7 @@ const nodemailer = require('nodemailer');
 const imaps      = require('imap-simple');
 const { simpleParser } = require('mailparser');
 
+// smtp fix applied
 const app = express();
 app.use(express.json());
 
