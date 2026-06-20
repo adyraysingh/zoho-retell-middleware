@@ -227,7 +227,7 @@ async function processCustomerEmail({ senderEmail, senderName, subject, bodyText
 
   // 4. Send reply via Gmail SMTP
   try {
-    await sendMayaReply({ to: senderEmail, toName: senderName, subject, replyText, replyHtml, inReplyTo: msgId, references });
+    await sendEmail({ to: senderEmail, toName: senderName, subject, text: replyText, html: replyHtml, inReplyTo: msgId, references });
     console.log('[email] Reply sent to ' + senderEmail);
   } catch (e) {
     console.error('[email] SMTP send failed:', e.message);
@@ -260,6 +260,15 @@ function startImapPolling() {
   pollGmailInbox(); // run immediately on start
   setInterval(pollGmailInbox, IMAP_POLL_INTERVAL_MS);
 }
+// ─── Send booking email when lead is interested ─────────────────────────────
+async function sendBookingEmail(leadName, email) {
+  const firstName = (leadName || '').split(' ')[0] || 'there';
+  const subject = 'Book Your MakeYourLabel Consultation';
+  const text = 'Hi ' + firstName + ',\n\nGreat news! Our team is ready to help you with your custom label and packaging needs.\n\nClick the link below to book your consultation at a time that works for you:\nhttps://start.makeyourlabel.com/\n\nLooking forward to connecting with you!\n\nRegards,\nMAYA | MakeYourLabel';
+  const html = '<div style="font-family:Arial,sans-serif;font-size:15px;color:#222;line-height:1.7;max-width:600px;"><p>Hi ' + firstName + ',</p><p>Great news! Our team is ready to help you with your custom label and packaging needs.</p><p><a href="https://start.makeyourlabel.com/" style="background:#000;color:#fff;padding:12px 28px;text-decoration:none;border-radius:4px;display:inline-block;font-weight:bold;">Book Your Consultation</a></p><p>Looking forward to connecting with you!</p><br><p>Regards,<br><strong>MAYA</strong> | MakeYourLabel</p></div>';
+  await sendEmail({ to: email, toName: leadName, subject, text, html });
+}
+
 // ─── Sequential Call Queue ────────────────────────────────────────────────────
 const callQueue = [];
 let isCallActive   = false;
