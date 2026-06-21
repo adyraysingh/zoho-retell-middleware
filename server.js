@@ -186,9 +186,8 @@ async function pollGmailInbox() {
   } catch (err) {
     console.error('[imap] Poll error:', err.message);
     if (connection) try { connection.end(); } catch (_) {}
-  } finally {
-    imapPolling = false;
   }
+  imapPolling = false; // always reset — prevents permanent lock if catch throws
 }
 // ─── Process one inbound customer email ──────────────────────────────────────
 async function processCustomerEmail({ senderEmail, senderName, subject, bodyText, msgId, references }) {
@@ -258,7 +257,7 @@ function startImapPolling() {
   }
   console.log('[imap] Starting inbox poll every ' + (IMAP_POLL_INTERVAL_MS/1000) + 's for ' + MAYA_EMAIL);
   pollGmailInbox(); // run immediately on start
-  setInterval(pollGmailInbox, IMAP_POLL_INTERVAL_MS);
+  setInterval(() => { imapPolling = false; pollGmailInbox(); }, IMAP_POLL_INTERVAL_MS);
 }
 // ─── Send booking email when lead is interested ─────────────────────────────
 async function sendBookingEmail(leadName, email) {
