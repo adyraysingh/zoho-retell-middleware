@@ -32,7 +32,7 @@ GMAIL_REFRESH_TOKEN,   // Google Workspace App Password for maya@
 const MAX_CALLS_PER_LEAD     = 3;
 const POST_CALL_GAP_MS       = 2 * 60 * 1000;
 const LOCK_SAFETY_TIMEOUT_MS = 20 * 60 * 1000;
-const IMAP_POLL_INTERVAL_MS  = 60 * 1000; // check inbox every 60 seconds
+const IMAP_POLL_INTERVAL_MS  = 30 * 1000; // check inbox every 30 seconds
 const MAYA_FROM              = 'MAYA | MakeYourLabel <' + (MAYA_EMAIL || 'maya@makeyourlabel.com') + '>';
 
 const TERMINAL_STATUSES = new Set([
@@ -114,6 +114,7 @@ async function generateMayaReply(leadName, customerMessage, emailHistory) {
 // Fetches UNREAD messages in INBOX every 60s, processes each through OpenAI → reply.
 let imapPolling = false;
 let processedMessageIds = new Set(); // track already-processed messages this session
+function capProcessedIds() { if (processedMessageIds.size > 500) processedMessageIds.clear(); }
 
 async function pollGmailInbox() {
   if (!MAYA_EMAIL || !GMAIL_REFRESH_TOKEN) {
@@ -130,7 +131,7 @@ async function pollGmailInbox() {
     // Search for UNREAD messages in INBOX not from ourselves
     const listRes = await gmail.users.messages.list({
       userId: 'me',
-      q: 'is:unread in:inbox',
+      q: 'is:unread (in:inbox OR in:spam)',
       maxResults: 20
     });
 
@@ -140,7 +141,8 @@ async function pollGmailInbox() {
       imapPolling = false;
       return;
     }
-    console.log('[gmail-poll] Found ' + messages.length + ' unread message(s)');
+    capProcessedIds(); // prevent memory leak
+console.log('[gmail-poll] Found ' + messages.length + ' unread message(s)');
 
     for (const msgRef of messages) {
       const msgId = msgRef.id;
