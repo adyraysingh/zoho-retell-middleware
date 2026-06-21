@@ -497,7 +497,7 @@ app.post('/webhook/inbound', async (req, res) => {
 app.get('/gmail/auth', (req, res) => {
   const { GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET } = process.env;
   const oauth2Client = new (require('googleapis').google.auth.OAuth2)(GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, 'https://zoho-retell-middleware-production.up.railway.app/gmail/callback');
-  const authUrl = oauth2Client.generateAuthUrl({ access_type: 'offline', scope: ['https://www.googleapis.com/auth/gmail.send'], prompt: 'consent' });
+  const authUrl = oauth2Client.generateAuthUrl({ access_type: 'offline', scope: ['https://www.googleapis.com/auth/gmail.modify'], prompt: 'consent' });
   res.redirect(authUrl);
 });
 
