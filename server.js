@@ -4,8 +4,6 @@ require('dotenv').config();
 const express    = require('express');
 const axios      = require('axios');
 const nodemailer = require('nodemailer');
-const imaps      = require('imap-simple');
-const { simpleParser } = require('mailparser');
 
 // smtp fix applied
 const app = express();
@@ -111,152 +109,118 @@ async function generateMayaReply(leadName, customerMessage, emailHistory) {
   return { replyText, replyHtml };
 }
 
-// ─── IMAP: Poll Gmail inbox for new customer replies ──────────────────────────
-// Connects to imap.gmail.com, fetches UNSEEN emails in INBOX,
-// skips anything from maya@ itself, processes each one through OpenAI → reply.
+// ─── Gmail API: Poll inbox for new customer replies ─────────────────────────
+// Uses Gmail API (HTTPS) instead of IMAP — Railway-safe, no port issues.
+// Fetches UNREAD messages in INBOX every 60s, processes each through OpenAI → reply.
 let imapPolling = false;
+let processedMessageIds = new Set(); // track already-processed messages this session
 
 async function pollGmailInbox() {
-  if (!MAYA_EMAIL || !MAYA_APP_PASSWORD) {
-    console.warn('[imap] MAYA_EMAIL or MAYA_APP_PASSWORD not set — skipping poll');
+  if (!MAYA_EMAIL || !GMAIL_REFRESH_TOKEN) {
+    console.warn('[gmail-poll] MAYA_EMAIL or GMAIL_REFRESH_TOKEN not set — skipping poll');
     return;
   }
-  if (imapPolling) return; // prevent overlapping polls
+  if (imapPolling) { console.log('[gmail-poll] Already polling, skipping'); return; }
   imapPolling = true;
+  console.log('[gmail-poll] Checking inbox...');
 
-  const config = {
-    imap: {
-      user    : MAYA_EMAIL,
-      password: MAYA_APP_PASSWORD,
-      host    : 'imap.gmail.com',
-      port    : 993,
-      tls     : true,
-      tlsOptions: { rejectUnauthorized: false },
-      authTimeout: 10000
-    }
-  };
-
-  let connection;
   try {
-    connection = await Promise.race([
-      imaps.connect(config),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('[imap] connect timeout after 15s')), 15000))
-    ]);
-    await connection.openBox('INBOX');
+    const gmail = getGmailClient();
 
-    // Fetch all UNSEEN messages
-    const searchCriteria = ['UNSEEN'];
-    const fetchOptions   = { bodies: [''], markSeen: true, struct: true };
-    const messages       = await connection.search(searchCriteria, fetchOptions);
+    // Search for UNREAD messages in INBOX not from ourselves
+    const listRes = await gmail.users.messages.list({
+      userId: 'me',
+      q: 'is:unread in:inbox -from:maya@makeyourlabel.com -from:me',
+      maxResults: 10
+    });
 
-    if (messages.length > 0) console.log('[imap] Found ' + messages.length + ' unread message(s)');
+    const messages = (listRes.data.messages) || [];
+    if (messages.length === 0) {
+      console.log('[gmail-poll] No unread messages');
+      imapPolling = false;
+      return;
+    }
+    console.log('[gmail-poll] Found ' + messages.length + ' unread message(s)');
 
-    for (const msg of messages) {
+    for (const msgRef of messages) {
+      const msgId = msgRef.id;
+      if (processedMessageIds.has(msgId)) continue; // skip already handled
+
       try {
-        const allParts = imaps.getParts(msg.attributes.struct);
-        const body     = msg.parts.find(p => p.which === '');
-        if (!body) continue;
+        // Fetch full message
+        const msgRes = await gmail.users.messages.get({
+          userId: 'me',
+          id: msgId,
+          format: 'full'
+        });
+        const msg = msgRes.data;
+        const headers = msg.payload && msg.payload.headers || [];
+        const getHeader = (name) => (headers.find(h => h.name.toLowerCase() === name.toLowerCase()) || {}).value || '';
 
-        const parsed      = await simpleParser(body.body);
-        const fromAddr    = parsed.from && parsed.from.value && parsed.from.value[0];
-        const senderEmail = (fromAddr && fromAddr.address || '').toLowerCase().trim();
-        const senderName  = (fromAddr && fromAddr.name)   || senderEmail;
-        const subject     = parsed.subject || '(no subject)';
-        const msgId       = parsed.messageId || '';
-        const references  = parsed.references ? (Array.isArray(parsed.references) ? parsed.references.join(' ') : parsed.references) : msgId;
-        const bodyText    = (parsed.text || '').replace(/\r\n/g,'\n').trim();
+        const fromRaw = getHeader('From');
+        const subject = getHeader('Subject') || '(no subject)';
+        const messageId = getHeader('Message-ID') || '';
+        const references = getHeader('References') || messageId;
+        const autoSubmitted = getHeader('Auto-Submitted');
 
-        // Skip our own outbound, empty bodies, auto-replies
-        if (!senderEmail || senderEmail.includes('makeyourlabel.com')) continue;
-        if (!bodyText || bodyText.length < 3) continue;
-        const autoSubmit = parsed.headers && parsed.headers.get('auto-submitted');
-        if (autoSubmit && autoSubmit !== 'no') continue;
+        // Parse sender
+        const emailMatch = fromRaw.match(/<([^>]+)>/) || fromRaw.match(/([\w._%+\-]+@[\w.\-]+\.[a-z]{2,})/i);
+        const senderEmail = emailMatch ? emailMatch[1].toLowerCase().trim() : fromRaw.toLowerCase().trim();
+        const nameMatch = fromRaw.match(/^"?([^"<]+)"?\s*</);
+        const senderName = nameMatch ? nameMatch[1].trim() : senderEmail;
 
-        console.log('[imap] Processing email from ' + senderEmail + ' | ' + subject);
-        await processCustomerEmail({ senderEmail, senderName, subject, bodyText, msgId, references });
+        // Skip own emails and auto-replies
+        if (!senderEmail || senderEmail.includes('makeyourlabel.com')) { processedMessageIds.add(msgId); continue; }
+        if (autoSubmitted && autoSubmitted.toLowerCase() !== 'no') { processedMessageIds.add(msgId); continue; }
+
+        // Extract body text
+        let bodyText = '';
+        const extractText = (part) => {
+          if (!part) return;
+          if (part.mimeType === 'text/plain' && part.body && part.body.data) {
+            bodyText += Buffer.from(part.body.data, 'base64').toString('utf8');
+          }
+          if (part.parts) part.parts.forEach(extractText);
+        };
+        extractText(msg.payload);
+        bodyText = bodyText.replace(/\r\n/g, '\n').trim();
+
+        if (!bodyText || bodyText.length < 3) { processedMessageIds.add(msgId); continue; }
+
+        console.log('[gmail-poll] Processing email from ' + senderEmail + ' | ' + subject);
+
+        // Mark as read immediately
+        await gmail.users.messages.modify({
+          userId: 'me',
+          id: msgId,
+          requestBody: { removeLabelIds: ['UNREAD'] }
+        });
+
+        processedMessageIds.add(msgId);
+        await processCustomerEmail({ senderEmail, senderName, subject, bodyText, msgId: messageId, references });
 
       } catch (msgErr) {
-        console.error('[imap] Error processing message:', msgErr.message);
+        console.error('[gmail-poll] Error processing message ' + msgRef.id + ':', msgErr.message);
+        processedMessageIds.add(msgRef.id); // mark done to avoid retry loop
       }
     }
-
-    connection.end();
   } catch (err) {
-    console.error('[imap] Poll error:', err.message);
-    if (connection) try { connection.end(); } catch (_) {}
+    console.error('[gmail-poll] Poll error:', err.message);
   }
-  imapPolling = false; // always reset — prevents permanent lock if catch throws
-}
-// ─── Process one inbound customer email ──────────────────────────────────────
-async function processCustomerEmail({ senderEmail, senderName, subject, bodyText, msgId, references }) {
-  // 1. Find lead in Zoho by email
-  let lead = null;
-  try {
-    lead = await findZohoLeadByEmail(senderEmail);
-    if (lead) console.log('[email] Matched lead: ' + lead.id + ' ' + (lead.First_Name||'') + ' ' + (lead.Last_Name||''));
-    else      console.log('[email] No Zoho lead for ' + senderEmail + ' — replying anyway');
-  } catch (e) { console.warn('[email] Zoho lookup failed:', e.message); }
-
-  const leadId   = lead ? lead.id : null;
-  const leadName = lead ? (((lead.First_Name||'')+' '+(lead.Last_Name||'')).trim()||senderName) : senderName;
-
-  // 2. Load email thread history from Zoho
-  let emailHistory = [];
-  if (lead && lead.AI_Email_Thread) {
-    try { emailHistory = JSON.parse(lead.AI_Email_Thread); } catch (_) {}
-  }
-  const shortMsg = bodyText.length > 500 ? bodyText.slice(0,500) + ' [...]' : bodyText;
-  emailHistory.push('Customer (' + new Date().toISOString() + '):\n' + shortMsg);
-
-  // 3. Generate reply via OpenAI
-  let replyText, replyHtml;
-  try {
-    const reply = await withRetry(() => generateMayaReply(leadName, bodyText, emailHistory));
-    replyText   = reply.replyText;
-    replyHtml   = reply.replyHtml;
-    console.log('[email] OpenAI reply ready (' + replyText.length + ' chars)');
-  } catch (e) {
-    console.error('[email] OpenAI failed:', e.message);
-    const fn = leadName.split(' ')[0] || 'there';
-    replyText = 'Hi ' + fn + ',\n\nThank you for your message! We will get back to you shortly.\n\nIn the meantime, you can get started here: https://start.makeyourlabel.com/\n\nRegards,\nMAYA | MakeYourLabel';
-    replyHtml = '<div style="font-family:Arial,sans-serif;font-size:15px;color:#222;line-height:1.7;max-width:600px;"><p>Hi ' + fn + ',</p><p>Thank you for your message! We will get back to you shortly.</p><p><a href="https://start.makeyourlabel.com/" style="background:#000;color:#fff;padding:12px 28px;text-decoration:none;border-radius:4px;display:inline-block;font-weight:bold;">Get Started</a></p><br><p>Regards,<br><strong>MAYA</strong> | MakeYourLabel</p></div>';
-  }
-
-  // 4. Send reply via Gmail SMTP
-  try {
-    await sendEmail({ to: senderEmail, toName: senderName, subject, text: replyText, html: replyHtml, inReplyTo: msgId, references });
-    console.log('[email] Reply sent to ' + senderEmail);
-  } catch (e) {
-    console.error('[email] SMTP send failed:', e.message);
-  }
-
-  // 5. Save thread + notes in Zoho
-  emailHistory.push('MAYA (' + new Date().toISOString() + '):\n' + replyText);
-  if (emailHistory.length > 20) emailHistory = emailHistory.slice(-20);
-
-  if (leadId) {
-    try {
-      await addZohoEmailNote(leadId, 'IN',  subject, shortMsg);
-      await addZohoEmailNote(leadId, 'OUT', subject, replyText);
-      await updateZohoLead(leadId, {
-        AI_Email_Thread    : JSON.stringify(emailHistory),
-        AI_Last_Email_Reply: nowISTString()
-      });
-      console.log('[email] Zoho updated for lead ' + leadId);
-    } catch (e) { console.error('[email] Zoho update failed:', e.message); }
-  }
+  imapPolling = false;
 }
 
-// Start IMAP polling loop
+// Start Gmail API polling loop
 function startImapPolling() {
-  if (!MAYA_EMAIL || !MAYA_APP_PASSWORD) {
-    console.warn('[imap] Not starting — MAYA_EMAIL or MAYA_APP_PASSWORD missing');
+  if (!MAYA_EMAIL || !GMAIL_REFRESH_TOKEN) {
+    console.warn('[gmail-poll] Not starting — MAYA_EMAIL or GMAIL_REFRESH_TOKEN missing');
     return;
   }
-  console.log('[imap] Starting inbox poll every ' + (IMAP_POLL_INTERVAL_MS/1000) + 's for ' + MAYA_EMAIL);
+  console.log('[gmail-poll] Starting inbox poll every ' + (IMAP_POLL_INTERVAL_MS/1000) + 's for ' + MAYA_EMAIL);
   pollGmailInbox(); // run immediately on start
   setInterval(() => { imapPolling = false; pollGmailInbox(); }, IMAP_POLL_INTERVAL_MS);
 }
+
 // ─── Send booking email when lead is interested ─────────────────────────────
 async function sendBookingEmail(leadName, email) {
   const firstName = (leadName || '').split(' ')[0] || 'there';
