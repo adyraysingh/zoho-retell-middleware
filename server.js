@@ -130,8 +130,8 @@ async function pollGmailInbox() {
     // Search for UNREAD messages in INBOX not from ourselves
     const listRes = await gmail.users.messages.list({
       userId: 'me',
-      q: 'is:unread in:inbox -from:maya@makeyourlabel.com -from:me',
-      maxResults: 10
+      q: 'is:unread in:inbox',
+      maxResults: 20
     });
 
     const messages = (listRes.data.messages) || [];
