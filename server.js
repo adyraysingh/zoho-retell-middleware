@@ -143,7 +143,10 @@ async function pollGmailInbox() {
 
   let connection;
   try {
-    connection = await imaps.connect(config);
+    connection = await Promise.race([
+      imaps.connect(config),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('[imap] connect timeout after 15s')), 15000))
+    ]);
     await connection.openBox('INBOX');
 
     // Fetch all UNSEEN messages
@@ -641,8 +644,8 @@ app.listen(port, () => {
   const missing  = REQUIRED.filter(v => !process.env[v]);
   if (missing.length) console.error('[server] MISSING: ' + missing.join(', '));
   else                console.log('[server] All required env vars present');
-  scheduleDailyRequeue();
-  setTimeout(runStartupRecoveryScan, 30000);
+  // scheduleDailyRequeue DISABLED — follow-up calls handled by scheduleFollowUpCall per lead
+  // runStartupRecoveryScan DISABLED — caused mass re-calls on every restart
   // Start IMAP polling for email replies
   setTimeout(startImapPolling, 5000);
 });
