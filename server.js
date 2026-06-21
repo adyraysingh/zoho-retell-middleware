@@ -34,10 +34,10 @@ GMAIL_REFRESH_TOKEN,   // Google Workspace App Password for maya@
 const MAX_CALLS_PER_LEAD     = 3;
 const POST_CALL_GAP_MS       = 2 * 60 * 1000;
 const LOCK_SAFETY_TIMEOUT_MS = 20 * 60 * 1000;
-const DAILY_REQUEUE_MAX      = 2000;
 const IMAP_POLL_INTERVAL_MS  = 60 * 1000; // check inbox every 60 seconds
 const MAYA_FROM              = 'MAYA | MakeYourLabel <' + (MAYA_EMAIL || 'maya@makeyourlabel.com') + '>';
 
+const TERMINAL_STATUSES = new Set([
   'Interested', 'Not Interested', 'Max Calls Reached'
 ]);
 const DO_NOT_CALL_LEAD_STATUSES = new Set([
@@ -442,36 +442,8 @@ return 'No Answer';
 }
 
 const IST_OFFSET_MS = 5.5 * 3600 * 1000;
-function getDelayUntilNext330AMIST() {
-  const nowUTC = Date.now(), nowIST = new Date(nowUTC + IST_OFFSET_MS);
-  const midIST = Date.UTC(nowIST.getUTCFullYear(), nowIST.getUTCMonth(), nowIST.getUTCDate()) - IST_OFFSET_MS;
-  let target = midIST + 3.5 * 3600 * 1000;
-  if (nowUTC >= target) target += 86400000;
-  return target - nowUTC;
-}
 
-// scheduleFollowUpCall REMOVED — follow-up calls disabled
 
-async function runStartupRecoveryScan() {
-  const base = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
-  let recovered = 0; let page = 1;
-  try {
-    while (true) {
-      const token = await getZohoAccessToken();
-      const r = await axios.get(base + '/crm/v3/Leads', { headers: { Authorization: 'Zoho-oauthtoken ' + token }, params: { fields: 'id,First_Name,Last_Name,Phone,Email,Company,AI_Call_Count,AI_Last_Call_Status,Lead_Status', per_page: 200, page } });
-      const leads = (r.data && r.data.data) || [];
-      if (!leads.length) break;
-      for (const lead of leads) {
-        if (isDoNotCallStatus(lead.Lead_Status||'') || parseInt(lead.AI_Call_Count||0) >= MAX_CALLS_PER_LEAD || TERMINAL_STATUSES.has((lead.AI_Last_Call_Status||'').trim()) || !lead.Phone || (lead.AI_Last_Call_Status||'').trim() !== 'Follow-Up Scheduled') continue;
-        enqueueCall({ id: lead.id, name: ((lead.First_Name||'')+' '+(lead.Last_Name||'')).trim()||'Valued Lead', phone: lead.Phone, email: lead.Email||'', company: lead.Company||'' }, 'startup-recovery', 'normal');
-        recovered++;
-      }
-      if (!(r.data && r.data.info && r.data.info.more_records)) break;
-      page++;
-    }
-  } catch(e) { console.error('[startup-recovery]', e.message); }
-  console.log('[startup-recovery] Done. recovered=' + recovered);
-}
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -514,10 +486,10 @@ app.post('/webhook/retell-callback', async (req, res) => {
   try { await updateZohoLead(leadId, { AI_Call_Count: count }); } catch(_) {}
   await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: callStatus, AI_Last_Call_Date: callDate, Call_Outcome: outcome, Meeting_Interested: meetingInterested, Booking_Link_Sent: bookingLinkSent, Call_Summary: transcript.slice(0,2000), Recording_URL: (call&&call.recording_url)||'', Transcript_URL: (call&&call.public_log_url)||'' });
   try { await addZohoNote(leadId, vars.lead_name||'Lead', callStatus, outcome, transcript, callDate); } catch(_) {}
-// Follow-up calls DISABLED — no automatic follow-up scheduling
-if (count >= MAX_CALLS_PER_LEAD) {
-try { await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: 'Max Calls Reached' }); } catch(_) {}
-}
+    // Follow-up calls DISABLED — no automatic re-calls after call ends
+    if (count >= MAX_CALLS_PER_LEAD) {
+      try { await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: 'Max Calls Reached' }); } catch(_) {}
+    }
   if (meetingInterested === 'Yes' && vars.lead_email) {
     try { await withRetry(() => sendBookingEmail(vars.lead_name||'', vars.lead_email)); console.log('[callback] Booking email sent to ' + vars.lead_email); } catch(e) { console.error('[callback] Email failed:', e.message); }
   }
@@ -541,11 +513,6 @@ app.post('/admin/queue/release-lock', (req, res) => {
   if (req.body.secret !== WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' });
   callEnded(true); res.json({ success: true });
 });
-app.post('/admin/run-requeue', async (req, res) => {
-  if (req.body.secret !== WEBHOOK_SECRET) return res.status(403).json({ error: 'Unauthorized' });
-  res.json({ success: true }); runDailyRequeue().catch(e => console.error('[requeue]', e.message));
-});
-
 // ROUTE 5: Inbound phone call
 app.post('/webhook/inbound', async (req, res) => {
   const from = (req.body && req.body.from_number) || '';
@@ -594,35 +561,6 @@ app.get('/oauth/callback', async (req, res) => {
   } catch(e) { return res.status(500).send(e.message); }
 });
 // ─── Daily 3:30 AM IST requeue ────────────────────────────────────────────────
-async function runDailyRequeue() {
-const base = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
-let page = 1, queued = 0, total = 0;
-try {
-while (true) {
-const token = await getZohoAccessToken();
-const r = await axios.get(base + '/crm/v3/Leads', { headers: { Authorization: 'Zoho-oauthtoken ' + token }, params: { fields: 'id,First_Name,Last_Name,Phone,Email,Company,AI_Call_Count,AI_Last_Call_Status,Lead_Status', per_page: 200, page } });
-const leads = (r.data && r.data.data) || [];
-total += leads.length; if (!leads.length) break;
-for (const lead of leads) {
-const count = parseInt(lead.AI_Call_Count||'0',10), status = (lead.AI_Last_Call_Status||'').trim(), lStatus = (lead.Lead_Status||'').trim();
-// Only re-queue leads EXPLICITLY marked Follow-Up Scheduled - never re-queue based on other statuses
-if (status !== 'Follow-Up Scheduled') continue;
-if (isDoNotCallStatus(lStatus)||count>=MAX_CALLS_PER_LEAD||TERMINAL_STATUSES.has(status)||!lead.Phone) continue;
-if (callQueue.some(i=>i.lead.id===lead.id)) continue;
-enqueueCall({ id: lead.id, name: ((lead.First_Name||'')+' '+(lead.Last_Name||'')).trim()||'Valued Lead', phone: lead.Phone, email: lead.Email||'', company: lead.Company||'' }, 'daily-requeue', 'normal');
-queued++;
-}
-if (!(r.data&&r.data.info&&r.data.info.more_records)||total>=DAILY_REQUEUE_MAX) break;
-page++;
-}
-} catch(e) { console.error('[daily-requeue]', e.message); }
-console.log('[daily-requeue] Done. queued=' + queued + '/' + total);
-}
-function scheduleDailyRequeue() {
-  const delay = getDelayUntilNext330AMIST();
-  console.log('[daily-requeue] Next run in ' + Math.round(delay/60000) + ' min');
-  setTimeout(async () => { await runDailyRequeue(); scheduleDailyRequeue(); }, delay);
-}
 
 // ─── Start Server ─────────────────────────────────────────────────────────────
 const port = PORT || 3000;
@@ -633,8 +571,6 @@ app.listen(port, () => {
   const missing  = REQUIRED.filter(v => !process.env[v]);
   if (missing.length) console.error('[server] MISSING: ' + missing.join(', '));
   else                console.log('[server] All required env vars present');
-  // scheduleDailyRequeue DISABLED — follow-up calls handled by scheduleFollowUpCall per lead
-  // runStartupRecoveryScan DISABLED — caused mass re-calls on every restart
   // Start IMAP polling for email replies
   setTimeout(startImapPolling, 5000);
 });
