@@ -221,6 +221,68 @@ function startImapPolling() {
   setInterval(() => { imapPolling = false; pollGmailInbox(); }, IMAP_POLL_INTERVAL_MS);
 }
 
+// ─── Process one inbound customer email ──────────────────────────────────────
+async function processCustomerEmail({ senderEmail, senderName, subject, bodyText, msgId, references }) {
+  // 1. Find lead in Zoho by email
+  let lead = null;
+  try {
+    lead = await findZohoLeadByEmail(senderEmail);
+    if (lead) console.log('[email] Matched lead: ' + lead.id + ' ' + (lead.First_Name||'') + ' ' + (lead.Last_Name||''));
+    else console.log('[email] No Zoho lead for ' + senderEmail + ' — replying anyway');
+  } catch (e) { console.warn('[email] Zoho lookup failed:', e.message); }
+
+  const leadId = lead ? lead.id : null;
+  const leadName = lead ? (((lead.First_Name||'')+' '+(lead.Last_Name||'')).trim()||senderName) : senderName;
+
+  // 2. Load email thread history from Zoho
+  let emailHistory = [];
+  if (lead && lead.AI_Email_Thread) {
+    try { emailHistory = JSON.parse(lead.AI_Email_Thread); } catch (_) {}
+  }
+  const shortMsg = bodyText.length > 500 ? bodyText.slice(0,500) + ' [...]' : bodyText;
+  emailHistory.push('Customer (' + new Date().toISOString() + '):\n' + shortMsg);
+
+  // 3. Generate reply via OpenAI
+  let replyText, replyHtml;
+  try {
+    const reply = await withRetry(() => generateMayaReply(leadName, bodyText, emailHistory));
+    replyText = reply.replyText;
+    replyHtml = reply.replyHtml;
+    console.log('[email] OpenAI reply ready (' + replyText.length + ' chars)');
+  } catch (e) {
+    console.error('[email] OpenAI failed:', e.message);
+    const fn = leadName.split(' ')[0] || 'there';
+    replyText = 'Hi ' + fn + ',\n\nThank you for your message! We will get back to you shortly.\n\nIn the meantime, you can get started here: https://start.makeyourlabel.com/\n\nRegards,\nMAYA | MakeYourLabel';
+    replyHtml = '<div style="font-family:Arial,sans-serif;font-size:15px;color:#222;line-height:1.7;max-width:600px;"><p>Hi ' + fn + ',</p><p>Thank you for your message! We will get back to you shortly.</p><p><a href="https://start.makeyourlabel.com/" style="background:#000;color:#fff;padding:12px 28px;text-decoration:none;border-radius:4px;display:inline-block;font-weight:bold;">Get Started</a></p><br><p>Regards,<br><strong>MAYA</strong> | MakeYourLabel</p></div>';
+  }
+
+  // 4. Send reply via Gmail API
+  try {
+    const replySubject = subject.startsWith('Re:') ? subject : 'Re: ' + subject;
+    await sendEmail({ to: senderEmail, toName: senderName, subject: replySubject, text: replyText, html: replyHtml, inReplyTo: msgId, references });
+    console.log('[email] Reply sent to ' + senderEmail);
+  } catch (e) {
+    console.error('[email] Send failed:', e.message);
+  }
+
+  // 5. Save thread + notes in Zoho
+  emailHistory.push('MAYA (' + new Date().toISOString() + '):\n' + replyText);
+  if (emailHistory.length > 20) emailHistory = emailHistory.slice(-20);
+
+  if (leadId) {
+    try {
+      await addZohoEmailNote(leadId, 'IN', subject, shortMsg);
+      await addZohoEmailNote(leadId, 'OUT', subject, replyText);
+      await updateZohoLead(leadId, {
+        AI_Email_Thread : JSON.stringify(emailHistory),
+        AI_Last_Email_Reply: nowISTString()
+      });
+      console.log('[email] Zoho updated for lead ' + leadId);
+    } catch (e) { console.error('[email] Zoho update failed:', e.message); }
+  }
+}
+
+
 // ─── Send booking email when lead is interested ─────────────────────────────
 async function sendBookingEmail(leadName, email) {
   const firstName = (leadName || '').split(' ')[0] || 'there';
