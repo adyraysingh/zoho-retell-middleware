@@ -38,11 +38,6 @@ const DAILY_REQUEUE_MAX      = 2000;
 const IMAP_POLL_INTERVAL_MS  = 60 * 1000; // check inbox every 60 seconds
 const MAYA_FROM              = 'MAYA | MakeYourLabel <' + (MAYA_EMAIL || 'maya@makeyourlabel.com') + '>';
 
-const FOLLOWUP_ELIGIBLE_STATUSES = new Set([
-  'No Answer', 'Voicemail', 'Callback Requested',
-  'Follow-Up Scheduled', 'Call Initiated', 'Failed', 'Call Failed'
-]);
-const TERMINAL_STATUSES = new Set([
   'Interested', 'Not Interested', 'Max Calls Reached'
 ]);
 const DO_NOT_CALL_LEAD_STATUSES = new Set([
@@ -455,9 +450,7 @@ function getDelayUntilNext330AMIST() {
   return target - nowUTC;
 }
 
-function scheduleFollowUpCall(lead, delayMs) {
-  setTimeout(() => { console.log('[followup] Enqueuing lead ' + lead.id); enqueueCall(lead, 'follow-up', 'normal'); }, delayMs);
-}
+// scheduleFollowUpCall REMOVED — follow-up calls disabled
 
 async function runStartupRecoveryScan() {
   const base = ZOHO_API_DOMAIN || 'https://www.zohoapis.in';
@@ -521,14 +514,10 @@ app.post('/webhook/retell-callback', async (req, res) => {
   try { await updateZohoLead(leadId, { AI_Call_Count: count }); } catch(_) {}
   await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: callStatus, AI_Last_Call_Date: callDate, Call_Outcome: outcome, Meeting_Interested: meetingInterested, Booking_Link_Sent: bookingLinkSent, Call_Summary: transcript.slice(0,2000), Recording_URL: (call&&call.recording_url)||'', Transcript_URL: (call&&call.public_log_url)||'' });
   try { await addZohoNote(leadId, vars.lead_name||'Lead', callStatus, outcome, transcript, callDate); } catch(_) {}
-  if (FOLLOWUP_ELIGIBLE_STATUSES.has(callStatus) && count < MAX_CALLS_PER_LEAD && freshPhone) {
-    const delay = getDelayUntilNext330AMIST();
-    const fireAt = new Date(Date.now()+delay+IST_OFFSET_MS).toISOString().replace('T',' ').replace(/\.\d+Z$/,'')+' IST';
-    try { await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: 'Follow-Up Scheduled', AI_Follow_Up_Scheduled: fireAt }); } catch(_) {}
-    scheduleFollowUpCall({ id: leadId, name: vars.lead_name||'Lead', phone: freshPhone, email: vars.lead_email||'', company: freshCompany }, delay);
-  } else if (FOLLOWUP_ELIGIBLE_STATUSES.has(callStatus) && count >= MAX_CALLS_PER_LEAD) {
-    try { await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: 'Max Calls Reached' }); } catch(_) {}
-  }
+// Follow-up calls DISABLED — no automatic follow-up scheduling
+if (count >= MAX_CALLS_PER_LEAD) {
+try { await safeUpdateZohoLead(leadId, { AI_Last_Call_Status: 'Max Calls Reached' }); } catch(_) {}
+}
   if (meetingInterested === 'Yes' && vars.lead_email) {
     try { await withRetry(() => sendBookingEmail(vars.lead_name||'', vars.lead_email)); console.log('[callback] Booking email sent to ' + vars.lead_email); } catch(e) { console.error('[callback] Email failed:', e.message); }
   }
