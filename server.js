@@ -32,7 +32,7 @@ GMAIL_REFRESH_TOKEN,   // Google Workspace App Password for maya@
 const MAX_CALLS_PER_LEAD     = 3;
 const POST_CALL_GAP_MS       = 2 * 60 * 1000;
 const LOCK_SAFETY_TIMEOUT_MS = 20 * 60 * 1000;
-const IMAP_POLL_INTERVAL_MS  = 30 * 1000; // check inbox every 30 seconds
+const IMAP_POLL_INTERVAL_MS  = 5 * 1000; // check inbox every 5 seconds (near-immediate)
 const MAYA_FROM              = 'MAYA | MakeYourLabel <' + (MAYA_EMAIL || 'maya@makeyourlabel.com') + '>';
 
 const TERMINAL_STATUSES = new Set([
